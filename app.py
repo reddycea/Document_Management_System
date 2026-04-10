@@ -501,7 +501,12 @@ async def root():
 
 # ==================== Authentication Routes ====================
 @app.post("/api/auth/login", response_model=Token)
-async def login(response: Response, user_login: UserLogin, request: Request, db: Session = Depends(get_db)):
+async def login(
+    request: Request,
+    response: Response, 
+    user_login: UserLogin, 
+    db: Session = Depends(get_db)
+):
     user = db.query(User).filter(User.username == user_login.username).first()
     if not user or not verify_password(user_login.password, user.hashed_password):
         raise HTTPException(401, "Invalid username or password")
@@ -517,7 +522,7 @@ async def login(response: Response, user_login: UserLogin, request: Request, db:
         key="access_token",
         value=token,
         httponly=True,
-        secure=False,  # Set to True in production with HTTPS
+        secure=False,
         samesite="lax",
         max_age=Config.ACCESS_TOKEN_EXPIRE_MINUTES * 60
     )
@@ -532,7 +537,6 @@ async def login(response: Response, user_login: UserLogin, request: Request, db:
     db.add(audit)
     db.commit()
     
-    return {"access_token": token, "token_type": "bearer"}
 
 @app.post("/api/auth/logout")
 async def logout(response: Response):
