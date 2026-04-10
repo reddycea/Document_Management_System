@@ -536,7 +536,9 @@ async def login(
     )
     db.add(audit)
     db.commit()
-    
+    return {
+    "access_token": token, "token_type": "bearer"
+}
 
 @app.post("/api/auth/logout")
 async def logout(response: Response):
@@ -556,9 +558,9 @@ async def get_current_user_info(current_user: User = Depends(get_current_user)):
 # ==================== Document Routes ====================
 @app.post("/api/documents/upload")
 async def upload_document(
+    request: Request,
     file: UploadFile = File(...),
     document_type: str = Form(...),
-    request: Request,
     current_user: User = Depends(role_required([UserRole.ADMIN, UserRole.APPROVER, UserRole.MANAGER])),
     db: Session = Depends(get_db)
 ):
