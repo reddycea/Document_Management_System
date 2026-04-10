@@ -408,7 +408,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
+@app.get("/")
+async def root():
+    return RedirectResponse(url="/login.html")
+    
 # ==================== Authentication Routes ====================
 @app.post("/api/auth/login", response_model=Token)
 async def login(response: Response, user_login: UserLogin, db: Session = Depends(get_db)):
