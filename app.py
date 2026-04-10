@@ -38,7 +38,12 @@ from dotenv import load_dotenv
 import uvicorn
 
 load_dotenv()
+import psycopg2
 
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+cur = conn.cursor()
 class Config:
     SECRET_KEY = os.getenv("SECRET_KEY")
     if not SECRET_KEY:
