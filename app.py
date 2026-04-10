@@ -167,14 +167,8 @@ SessionLocal = None
 
 try:
     database_url = Config.get_database_url()
-    
-    # Configure engine based on database type
-    if "sqlite" in database_url:
-        engine = create_engine(
-            database_url, 
-            connect_args={"check_same_thread": False}
-        )
-    elif "postgresql" in database_url:
+
+    if "postgresql" in database_url:
         # PostgreSQL specific configuration
         engine = create_engine(
             database_url,
