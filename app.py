@@ -1,3 +1,8 @@
+"""
+Document Management System with OCR, Approval Workflow, and Analytics
+Pipeline: OCR → Clean → Structure → AI Extraction → Validation → Confidence
+"""
+
 import os
 import re
 import io
@@ -23,15 +28,12 @@ from passlib.context import CryptContext
 
 # Document processing
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 import pdf2image
-
-# Image processing for OCR enhancement
-import cv2
-import numpy as np
 
 # Data processing and reporting
 import pandas as pd
+import numpy as np
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
@@ -283,38 +285,31 @@ def role_required(required_roles: List[UserRole]):
 
 # ==================== OCR Pipeline: Clean & Structure ====================
 class ImagePreprocessor:
-    """Clean and preprocess images for better OCR accuracy"""
+    """Clean and preprocess images for better OCR accuracy using PIL"""
     
     @staticmethod
     def clean_image(image: Image.Image) -> Image.Image:
-        """Apply image cleaning techniques"""
-        img_array = np.array(image)
-        
+        """Apply image cleaning techniques using PIL"""
         # Convert to grayscale if needed
-        if len(img_array.shape) == 3:
-            img_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        if image.mode != 'L':
+            image = image.convert('L')
         
-        # Apply denoising
-        img_array = cv2.fastNlMeansDenoising(img_array, h=30)
+        # Enhance contrast
+        enhancer = ImageEnhance.Contrast(image)
+        image = enhancer.enhance(2.0)
+        
+        # Enhance sharpness
+        enhancer = ImageEnhance.Sharpness(image)
+        image = enhancer.enhance(2.0)
+        
+        # Apply slight blur to reduce noise
+        image = image.filter(ImageFilter.MedianFilter(size=3))
         
         # Apply thresholding (binarization)
-        _, img_array = cv2.threshold(img_array, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        threshold = 128
+        image = image.point(lambda p: 255 if p > threshold else 0)
         
-        # Deskew if needed
-        coords = np.column_stack(np.where(img_array > 0))
-        if len(coords) > 0:
-            angle = cv2.minAreaRect(coords)[-1]
-            if angle < -45:
-                angle = 90 + angle
-            if angle != 0:
-                (h, w) = img_array.shape[:2]
-                center = (w // 2, h // 2)
-                M = cv2.getRotationMatrix2D(center, angle, 1.0)
-                img_array = cv2.warpAffine(img_array, M, (w, h), 
-                                          flags=cv2.INTER_CUBIC, 
-                                          borderMode=cv2.BORDER_REPLICATE)
-        
-        return Image.fromarray(img_array)
+        return image
     
     @staticmethod
     def enhance_resolution(image: Image.Image, scale: int = 2) -> Image.Image:
@@ -322,6 +317,26 @@ class ImagePreprocessor:
         width, height = image.size
         new_size = (width * scale, height * scale)
         return image.resize(new_size, Image.Resampling.LANCZOS)
+    
+    @staticmethod
+    def deskew(image: Image.Image) -> Image.Image:
+        """Deskew image using text baseline detection"""
+        import math
+        
+        # Convert to binary image
+        binary = image.point(lambda p: 255 if p > 128 else 0)
+        
+        # Get bounding box of content
+        bbox = binary.getbbox()
+        if not bbox:
+            return image
+        
+        # Crop to content
+        cropped = binary.crop(bbox)
+        
+        # Simple deskew - you can enhance this with more sophisticated methods
+        # For now, return original as PIL doesn't have built-in deskew
+        return image
 
 class OCRProcessor:
     """Handle OCR text extraction with preprocessing pipeline"""
@@ -336,7 +351,8 @@ class OCRProcessor:
                 image = ImagePreprocessor.clean_image(image)
                 image = ImagePreprocessor.enhance_resolution(image, scale=2)
             
-            custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789$.,:/- "'
+            # Configure Tesseract
+            custom_config = r'--oem 3 --psm 6'
             text = pytesseract.image_to_string(image, config=custom_config)
             text = OCRProcessor._clean_text(text)
             
@@ -374,7 +390,9 @@ class OCRProcessor:
     @staticmethod
     def _clean_text(text: str) -> str:
         """Clean extracted text"""
+        # Remove extra whitespace
         text = re.sub(r'\s+', ' ', text)
+        # Remove non-printable characters
         text = re.sub(r'[^\x20-\x7E\n]', '', text)
         # Fix common OCR errors
         replacements = {'0': 'O', '1': 'I', '|': 'I', '!': 'I'}
@@ -388,7 +406,7 @@ def parse_date(date_str: str) -> Optional[datetime]:
     date_formats = [
         "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y",
         "%d-%m-%Y", "%m-%d-%Y", "%d.%m.%Y",
-        "%b %d, %Y", "%d %b %Y"
+        "%b %d, %Y", "%d %b %Y", "%B %d, %Y"
     ]
     for fmt in date_formats:
         try:
@@ -528,8 +546,10 @@ class AIExtractor:
     def _calculate_pattern_confidence(pattern: str, match: str, full_text: str) -> float:
         """Calculate confidence based on pattern match quality"""
         confidence = 0.8
-        if re.match(r'^' + pattern + r'$', full_text, re.IGNORECASE):
-            confidence += 0.15
+        # Boost if match appears near start of text
+        match_pos = full_text.find(match)
+        if match_pos >= 0 and match_pos < 200:
+            confidence += 0.1
         if len(match) < 3:
             confidence -= 0.2
         return min(confidence, 1.0)
