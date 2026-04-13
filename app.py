@@ -1,8 +1,3 @@
-"""
-Document Management System with OCR, Approval Workflow, and Analytics
-Pipeline: OCR → Clean → Structure → AI Extraction → Validation → Confidence
-"""
-
 import os
 import re
 import io
@@ -58,14 +53,14 @@ class Config:
     ALGORITHM = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 30))
 
-    # PostgreSQL Configuration (default for production)
+    # PostgreSQL Configuration
     PG_HOST = os.getenv("PG_HOST", "localhost")
     PG_PORT = os.getenv("PG_PORT", "5432")
     PG_USER = os.getenv("PG_USER", "postgres")
     PG_PASSWORD = os.getenv("PG_PASSWORD", "postgres")
     PG_DB = os.getenv("PG_DB", "doc_management")
 
-    # MySQL fallback (optional)
+    # MySQL Configuration
     MYSQL_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
     MYSQL_PORT = os.getenv("MYSQL_PORT", "3306")
     MYSQL_USER = os.getenv("MYSQL_USER", "root")
@@ -285,7 +280,7 @@ def role_required(required_roles: List[UserRole]):
 
 # ==================== OCR Pipeline: Clean & Structure ====================
 class ImagePreprocessor:
-    """Clean and preprocess images for better OCR accuracy using PIL"""
+    """Clean and preprocess images for better OCR accuracy"""
     
     @staticmethod
     def clean_image(image: Image.Image) -> Image.Image:
@@ -317,26 +312,6 @@ class ImagePreprocessor:
         width, height = image.size
         new_size = (width * scale, height * scale)
         return image.resize(new_size, Image.Resampling.LANCZOS)
-    
-    @staticmethod
-    def deskew(image: Image.Image) -> Image.Image:
-        """Deskew image using text baseline detection"""
-        import math
-        
-        # Convert to binary image
-        binary = image.point(lambda p: 255 if p > 128 else 0)
-        
-        # Get bounding box of content
-        bbox = binary.getbbox()
-        if not bbox:
-            return image
-        
-        # Crop to content
-        cropped = binary.crop(bbox)
-        
-        # Simple deskew - you can enhance this with more sophisticated methods
-        # For now, return original as PIL doesn't have built-in deskew
-        return image
 
 class OCRProcessor:
     """Handle OCR text extraction with preprocessing pipeline"""
@@ -351,7 +326,7 @@ class OCRProcessor:
                 image = ImagePreprocessor.clean_image(image)
                 image = ImagePreprocessor.enhance_resolution(image, scale=2)
             
-            # Configure Tesseract
+            # Configure Tesseract for better accuracy
             custom_config = r'--oem 3 --psm 6'
             text = pytesseract.image_to_string(image, config=custom_config)
             text = OCRProcessor._clean_text(text)
@@ -365,8 +340,9 @@ class OCRProcessor:
     
     @staticmethod
     def extract_text_from_pdf(pdf_path: str, preprocess: bool = True) -> str:
-        """Extract text from PDF using pdf2image and OCR"""
+        """Extract text from PDF using pdf2image and OCR at 300 DPI"""
         try:
+            # Convert PDF to images at 300 DPI for better quality
             images = pdf2image.convert_from_path(pdf_path, dpi=300)
             all_text = []
             
@@ -526,7 +502,7 @@ class AIExtractor:
                 extracted[field] = best_match
                 field_confidences[field] = round(best_confidence, 2)
         
-        # Post-processing
+        # Post-processing and cross-field validation
         if extracted.get("amount") and extracted.get("tax_rate") and not extracted.get("vat_amount"):
             extracted["vat_amount"] = round(extracted["amount"] * extracted["tax_rate"] / 100, 2)
         
@@ -975,7 +951,7 @@ async def get_document(
         ]
     }
 
-# ==================== Approval Routes (3-step) ====================
+# ==================== Approval Routes ====================
 @app.post("/api/approval/process")
 async def process_approval(
     action: ApprovalAction,
