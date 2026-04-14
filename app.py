@@ -3,6 +3,7 @@ import re
 import io
 import uuid
 import hashlib
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 from enum import Enum
@@ -22,12 +23,15 @@ from passlib.context import CryptContext
 
 # Document processing
 import pytesseract
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image
 import pdf2image
+
+# Image processing for OCR enhancement
+import cv2
+import numpy as np
 
 # Data processing and reporting
 import pandas as pd
-import numpy as np
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
@@ -39,6 +43,11 @@ import uvicorn
 
 load_dotenv()
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ==================== Configuration ====================
 class Config:
     SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
     if not SECRET_KEY or SECRET_KEY == "your-secret-key-change-this-in-production":
@@ -64,7 +73,7 @@ class Config:
     # Database selection
     DATABASE_TYPE = os.getenv("DATABASE_TYPE", "postgresql").lower()
     
-    # Render.com PostgreSQL URL (automatically provided)
+    # Render.com PostgreSQL URL
     RENDER_DATABASE_URL = os.getenv("DATABASE_URL")
     
     SQLITE_URL = "sqlite:///./doc_management.db"
@@ -92,7 +101,7 @@ class Config:
             print("⚠️ Using SQLite database (development only)")
             return cls.SQLITE_URL
 
-# ==================== Database Setup ====================
+# ==================== Database Models ====================
 Base = declarative_base()
 
 class UserRole(str, Enum):
@@ -132,13 +141,13 @@ class Document(Base):
     amount = Column(Float)
     vat_amount = Column(Float)
     tax_rate = Column(Float)
+    extraction_confidence = Column(Float, default=0.0)
     upload_date = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     uploaded_by = Column(Integer, ForeignKey("users.id"))
     status = Column(SQLEnum(ApprovalStatus), default=ApprovalStatus.PENDING_LEVEL1)
     is_duplicate = Column(Boolean, default=False)
     duplicate_reason = Column(Text)
-    extraction_confidence = Column(Float, default=0.0)
-    extracted_raw_text = Column(Text)
+    validation_errors = Column(Text)
     uploader = relationship("User")
 
 class Approval(Base):
@@ -160,17 +169,21 @@ class AuditLog(Base):
     ip_address = Column(String(45))
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
-# Create engine
+# ==================== Database Setup ====================
 engine = None
 SessionLocal = None
 
 try:
     database_url = Config.get_database_url()
-    
-    if "sqlite" in database_url:
-        engine = create_engine(database_url, connect_args={"check_same_thread": False})
-    elif "postgresql" in database_url:
-        engine = create_engine(database_url, pool_pre_ping=True, pool_size=10, max_overflow=20, pool_recycle=3600, echo=False)
+    if "postgresql" in database_url:
+        engine = create_engine(
+            database_url,
+            pool_pre_ping=True,
+            pool_size=10,
+            max_overflow=20,
+            pool_recycle=3600,
+            echo=False
+        )
     else:
         engine = create_engine(database_url, pool_pre_ping=True, pool_recycle=3600)
     
@@ -268,308 +281,331 @@ def role_required(required_roles: List[UserRole]):
         return current_user
     return checker
 
-# ==================== File Validation ====================
-def validate_file(file_content: bytes, filename: str) -> None:
-    if len(file_content) > Config.MAX_FILE_SIZE:
-        raise HTTPException(400, f"Max size {Config.MAX_FILE_SIZE//1024//1024}MB")
-    ext = os.path.splitext(filename)[1].lower()
-    if ext not in Config.ALLOWED_EXTENSIONS:
-        raise HTTPException(400, f"Allowed extensions: {Config.ALLOWED_EXTENSIONS}")
-    magic_map = {b'%PDF': '.pdf', b'\xff\xd8': '.jpg', b'\x89PNG': '.png'}
-    detected = None
-    for magic, ext2 in magic_map.items():
-        if file_content.startswith(magic):
-            detected = ext2
-            break
-    if detected and detected != ext:
-        raise HTTPException(400, "File extension mismatch")
-
-def generate_secure_filename(original: str) -> str:
-    ext = os.path.splitext(original)[1].lower()
-    return f"{uuid.uuid4().hex}{ext}"
-
-# ==================== Enhanced AI Document Extractor ====================
-class AIExtractor:
-    
-    PATTERNS = {
-        "vendor_name": [
-            r"(?:Vendor|Supplier|Company|Bill From|Seller|Issuer|Sold by)[\s:]+([A-Za-z0-9\s&.,'-]+)(?:\n|$)",
-            r"^(?:From|Vendor|Supplier):\s*([A-Za-z0-9\s&.,'-]+)(?:\n|$)",
-            r"([A-Za-z0-9\s&.,'-]+)(?:\n)(?:Invoice|Bill|Statement)",
-            r"(?:Company|Business)[\s:]+([A-Za-z0-9\s&.,'-]+)",
-            r"^([A-Za-z0-9\s&.,'-]+)(?:\n)(?:Address|Phone|Email)",
-        ],
-        "invoice_number": [
-            r"(?:Invoice|Document|Bill|Statement)[\s#:]+(\S+)",
-            r"(?:INV|INVOICE|INV-#|Invoice Number)[\s\-:]*([A-Z0-9\-]+)",
-            r"Number[\s:]+([A-Z0-9\-]+)",
-            r"Ref(?:erence)?[\s:]+([A-Z0-9\-]+)",
-            r"Order #:\s*(\S+)",
-        ],
-        "invoice_date": [
-            r"(?:Date|Invoice Date|Issue Date|Date of Issue)[\s:]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-            r"(?:Date|Invoice Date)[\s:]+(\d{4}-\d{2}-\d{2})",
-            r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-            r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}",
-        ],
-        "due_date": [
-            r"(?:Due Date|Payment Due|Pay by)[\s:]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-            r"(?:Due Date)[\s:]+(\d{4}-\d{2}-\d{2})",
-        ],
-        "po_number": [
-            r"(?:PO|Purchase Order|Order)[\s#:]+(\S+)",
-            r"PO\s*#?\s*([A-Z0-9\-]+)",
-        ],
-        "amount": [
-            r"(?:Total|Amount Due|Grand Total|Balance Due|Invoice Total)[\s:]*[$€£]?([\d,]+\.?\d*)",
-            r"TOTAL\s+[$€£]?([\d,]+\.?\d*)",
-            r"Amount\s+[Dd]ue:\s*[$€£]?([\d,]+\.?\d*)",
-            r"Net Amount:\s*[$€£]?([\d,]+\.?\d*)",
-            r"Subtotal:\s*[$€£]?([\d,]+\.?\d*)",
-        ],
-        "vat_amount": [
-            r"(?:VAT|Tax|GST|HST|IVA|TVQ)[\s:]*[$€£]?([\d,]+\.?\d*)",
-            r"Tax Amount\s+[$€£]?([\d,]+\.?\d*)",
-            r"VAT\s+[@%]?\s*\d+%?\s+[$€£]?([\d,]+\.?\d*)",
-            r"(?:GST|HST):\s*[$€£]?([\d,]+\.?\d*)",
-        ],
-        "tax_rate": [
-            r"VAT\s+(\d+(?:\.\d+)?)%",
-            r"Tax\s+(\d+(?:\.\d+)?)%",
-            r"GST\s+(\d+(?:\.\d+)?)%",
-        ]
-    }
+# ==================== OCR Pipeline: Clean & Structure ====================
+class ImagePreprocessor:
+    """Clean and preprocess images for better OCR accuracy"""
     
     @staticmethod
-    async def extract_from_image(image_path: str):
+    def clean_image(image: Image.Image) -> Image.Image:
+        """Apply image cleaning techniques"""
+        img_array = np.array(image)
+        
+        # Convert to grayscale if needed
+        if len(img_array.shape) == 3:
+            img_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        
+        # Apply denoising
+        img_array = cv2.fastNlMeansDenoising(img_array, h=30)
+        
+        # Apply thresholding (binarization)
+        _, img_array = cv2.threshold(img_array, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # Deskew if needed
+        coords = np.column_stack(np.where(img_array > 0))
+        if len(coords) > 0:
+            angle = cv2.minAreaRect(coords)[-1]
+            if angle < -45:
+                angle = 90 + angle
+            if angle != 0:
+                (h, w) = img_array.shape[:2]
+                center = (w // 2, h // 2)
+                M = cv2.getRotationMatrix2D(center, angle, 1.0)
+                img_array = cv2.warpAffine(img_array, M, (w, h), 
+                                          flags=cv2.INTER_CUBIC, 
+                                          borderMode=cv2.BORDER_REPLICATE)
+        
+        return Image.fromarray(img_array)
+    
+    @staticmethod
+    def enhance_resolution(image: Image.Image, scale: int = 2) -> Image.Image:
+        """Enhance image resolution using interpolation"""
+        width, height = image.size
+        new_size = (width * scale, height * scale)
+        return image.resize(new_size, Image.Resampling.LANCZOS)
+
+class OCRProcessor:
+    """Handle OCR text extraction with preprocessing pipeline"""
+    
+    @staticmethod
+    def extract_text(image_path: str, preprocess: bool = True) -> str:
+        """Extract text from image with preprocessing"""
         try:
             image = Image.open(image_path)
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
             
-            enhancer = ImageEnhance.Contrast(image)
-            image = enhancer.enhance(2.0)
-            image = image.filter(ImageFilter.SHARPEN)
+            if preprocess:
+                image = ImagePreprocessor.clean_image(image)
+                image = ImagePreprocessor.enhance_resolution(image, scale=2)
             
-            if max(image.size) > 2000:
-                ratio = 2000 / max(image.size)
-                new_size = tuple(int(dim * ratio) for dim in image.size)
-                image = image.resize(new_size, Image.Resampling.LANCZOS)
+            custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789$.,:/- "'
+            text = pytesseract.image_to_string(image, config=custom_config)
+            text = OCRProcessor._clean_text(text)
             
-            configs = ['--oem 3 --psm 6', '--oem 3 --psm 4', '--oem 3 --psm 3']
-            all_text = ""
-            for config in configs:
-                text = pytesseract.image_to_string(image, config=config)
-                all_text += text + "\n"
+            logger.info(f"OCR extracted {len(text)} characters from {image_path}")
+            return text
             
-            extracted = AIExtractor._parse_document_text(all_text)
-            confidence = AIExtractor._calculate_confidence(extracted, all_text)
-            return extracted, confidence
         except Exception as e:
-            print(f"OCR error: {e}")
-            return AIExtractor._get_empty_extraction(), 0.0
+            logger.error(f"OCR failed for {image_path}: {e}")
+            return ""
     
     @staticmethod
-    async def extract_from_pdf(pdf_path: str):
+    def extract_text_from_pdf(pdf_path: str, preprocess: bool = True) -> str:
+        """Extract text from PDF using pdf2image and OCR"""
         try:
-            images = pdf2image.convert_from_path(pdf_path, first_page=1, last_page=5, dpi=300)
-            all_text = ""
-            for img in images:
-                if img.mode != 'RGB':
-                    img = img.convert('RGB')
-                enhancer = ImageEnhance.Contrast(img)
-                img = enhancer.enhance(2.0)
-                text = pytesseract.image_to_string(img)
-                all_text += text + "\n"
+            images = pdf2image.convert_from_path(pdf_path, dpi=300)
+            all_text = []
             
-            extracted = AIExtractor._parse_document_text(all_text)
-            confidence = AIExtractor._calculate_confidence(extracted, all_text)
-            return extracted, confidence
+            for i, image in enumerate(images):
+                logger.info(f"Processing PDF page {i+1}/{len(images)}")
+                
+                if preprocess:
+                    image = ImagePreprocessor.clean_image(image)
+                    image = ImagePreprocessor.enhance_resolution(image, scale=2)
+                
+                custom_config = r'--oem 3 --psm 6'
+                text = pytesseract.image_to_string(image, config=custom_config)
+                all_text.append(OCRProcessor._clean_text(text))
+            
+            return "\n".join(all_text)
+            
         except Exception as e:
-            print(f"PDF extraction error: {e}")
-            return AIExtractor._get_empty_extraction(), 0.0
+            logger.error(f"PDF OCR failed for {pdf_path}: {e}")
+            return ""
     
     @staticmethod
-    def _parse_document_text(text: str):
-        data = {
-            "vendor_name": None,
-            "invoice_number": None,
-            "invoice_date": None,
-            "amount": None,
-            "vat_amount": None,
-            "tax_rate": None,
-            "po_number": None,
-            "due_date": None
+    def _clean_text(text: str) -> str:
+        """Clean extracted text"""
+        text = re.sub(r'\s+', ' ', text)
+        text = re.sub(r'[^\x20-\x7E\n]', '', text)
+        # Fix common OCR errors
+        replacements = {'0': 'O', '1': 'I', '|': 'I', '!': 'I'}
+        for wrong, correct in replacements.items():
+            text = text.replace(wrong, correct)
+        return text.strip()
+
+# ==================== AI Extraction ====================
+def parse_date(date_str: str) -> Optional[datetime]:
+    """Parse date from various formats"""
+    date_formats = [
+        "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y",
+        "%d-%m-%Y", "%m-%d-%Y", "%d.%m.%Y",
+        "%b %d, %Y", "%d %b %Y"
+    ]
+    for fmt in date_formats:
+        try:
+            return datetime.strptime(date_str.strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+class AIExtractor:
+    """AI-powered document field extraction with confidence scoring"""
+    
+    EXTRACTION_PATTERNS = {
+        "vendor_name": {
+            "patterns": [
+                r"(?:Vendor|Supplier|Company|Bill From|Seller|Issuer)[\s:]+([A-Za-z0-9\s&.,]+)(?:\n|$)",
+                r"(?:From|Sold by)[\s:]+([A-Za-z0-9\s&.,]+)(?:\n|$)",
+                r"^([A-Za-z\s&.,]+)(?:\n|$)",
+            ],
+            "weight": 0.9,
+            "validation": lambda x: len(x) > 2 and len(x) < 100
+        },
+        "invoice_number": {
+            "patterns": [
+                r"(?:Invoice|Document|Bill)[\s#:]+([A-Z0-9\-]+)",
+                r"(?:INV|INVOICE)[\s\-]*([A-Z0-9\-]+)",
+                r"Number[\s:]+([A-Z0-9\-]+)",
+            ],
+            "weight": 1.0,
+            "validation": lambda x: len(x) > 3 and len(x) < 50
+        },
+        "invoice_date": {
+            "patterns": [
+                r"(?:Date|Invoice Date|Issue Date)[\s:]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+                r"(?:Date|Invoice Date|Issue Date)[\s:]+(\d{4}-\d{2}-\d{2})",
+                r"(\d{1,2}/\d{1,2}/\d{4})",
+            ],
+            "weight": 0.95,
+            "validation": lambda x: True,
+            "parser": parse_date
+        },
+        "amount": {
+            "patterns": [
+                r"(?:Total|Amount Due|Grand Total|Balance Due)[\s:]*[$]?([\d,]+\.?\d*)",
+                r"TOTAL\s+[$]?([\d,]+\.?\d*)",
+                r"(?:Sum|Net Amount)[\s:]*[$]?([\d,]+\.?\d*)",
+            ],
+            "weight": 0.95,
+            "validation": lambda x: x > 0 and x < 10000000,
+            "parser": lambda x: float(x.replace(",", ""))
+        },
+        "vat_amount": {
+            "patterns": [
+                r"(?:VAT|Tax|GST|HST)[\s:]*[$]?([\d,]+\.?\d*)",
+                r"Tax Amount\s+[$]?([\d,]+\.?\d*)",
+                r"(?:VAT|Tax)[\s:]+(\d+\.?\d*)%",
+            ],
+            "weight": 0.85,
+            "validation": lambda x: x >= 0 and x < 1000000,
+            "parser": lambda x: float(x.replace(",", "")) if not x.endswith('%') else None
+        },
+        "tax_rate": {
+            "patterns": [
+                r"(?:VAT|Tax|GST) Rate[\s:]+(\d+\.?\d*)%",
+                r"Tax\s+(\d+\.?\d*)%",
+            ],
+            "weight": 0.7,
+            "validation": lambda x: 0 <= x <= 100,
+            "parser": lambda x: float(x.replace("%", ""))
         }
+    }
+    
+    @classmethod
+    async def extract_from_image(cls, image_path: str) -> Dict[str, Any]:
+        """Extract fields from image with confidence scoring"""
+        text = OCRProcessor.extract_text(image_path, preprocess=True)
+        return await cls._extract_fields(text)
+    
+    @classmethod
+    async def extract_from_pdf(cls, pdf_path: str) -> Dict[str, Any]:
+        """Extract fields from PDF with confidence scoring"""
+        text = OCRProcessor.extract_text_from_pdf(pdf_path, preprocess=True)
+        return await cls._extract_fields(text)
+    
+    @classmethod
+    async def _extract_fields(cls, text: str) -> Dict[str, Any]:
+        """Core extraction logic with multi-pattern matching and confidence"""
+        extracted = {}
+        field_confidences = {}
         
-        text = text.replace(',', ' ').strip()
-        lines = text.split('\n')
-        
-        for key, patterns in AIExtractor.PATTERNS.items():
-            for pattern in patterns:
-                matches = re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE)
+        for field, config in cls.EXTRACTION_PATTERNS.items():
+            best_match = None
+            best_confidence = 0
+            
+            for pattern in config["patterns"]:
+                matches = re.findall(pattern, text, re.IGNORECASE | re.MULTILINE)
                 for match in matches:
-                    val = match.group(1).strip()
+                    value = match if isinstance(match, str) else match[0]
+                    value = value.strip()
                     
-                    if key == "invoice_date" or key == "due_date":
-                        parsed_date = AIExtractor._parse_date(val)
-                        if parsed_date:
-                            data[key] = parsed_date
-                            break
-                    elif key in ["amount", "vat_amount", "tax_rate"]:
+                    if "parser" in config:
                         try:
-                            num_val = float(val.replace(",", "").replace("$", "").replace("€", "").replace("£", ""))
-                            if key == "tax_rate" and num_val > 100:
-                                num_val = num_val / 100
-                            data[key] = num_val
-                            break
+                            value = config["parser"](value)
                         except:
-                            pass
-                    elif key == "vendor_name":
-                        if len(val) > 2 and len(val) < 200 and not val.isdigit():
-                            data[key] = val
-                            break
-                    else:
-                        if val and len(val) < 100:
-                            data[key] = val
-                            break
+                            continue
+                    
+                    if config["validation"] and not config["validation"](value):
+                        continue
+                    
+                    pattern_confidence = cls._calculate_pattern_confidence(pattern, str(match), text)
+                    confidence = config["weight"] * pattern_confidence
+                    
+                    if confidence > best_confidence:
+                        best_match = value
+                        best_confidence = confidence
+            
+            if best_match is not None:
+                extracted[field] = best_match
+                field_confidences[field] = round(best_confidence, 2)
         
-        if not data["vendor_name"]:
-            for line in lines[:10]:
-                line = line.strip()
-                if len(line) > 3 and len(line) < 100:
-                    if any(indicator in line.upper() for indicator in ["INC", "LLC", "LTD", "CORP", "COMPANY"]):
-                        data["vendor_name"] = line
-                        break
-                    if line.isupper() and 5 < len(line) < 60:
-                        data["vendor_name"] = line
-                        break
+        # Post-processing
+        if extracted.get("amount") and extracted.get("tax_rate") and not extracted.get("vat_amount"):
+            extracted["vat_amount"] = round(extracted["amount"] * extracted["tax_rate"] / 100, 2)
         
-        if data["amount"] and not data["vat_amount"] and data.get("tax_rate"):
-            data["vat_amount"] = round(data["amount"] * data["tax_rate"] / 100, 2)
+        if extracted.get("amount") and extracted.get("vat_amount"):
+            if extracted["vat_amount"] > extracted["amount"]:
+                extracted["vat_amount"] = None
         
-        return data
-    
-    @staticmethod
-    def _parse_date(date_str: str):
-        date_formats = [
-            "%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d", "%m-%d-%Y", "%d-%m-%Y",
-            "%b %d, %Y", "%B %d, %Y", "%d %b %Y", "%d %B %Y",
-            "%Y/%m/%d", "%m/%d/%y", "%d/%m/%y"
-        ]
+        overall_confidence = cls._calculate_overall_confidence(extracted, field_confidences)
         
-        date_str = date_str.strip()
-        
-        for fmt in date_formats:
-            try:
-                parsed = datetime.strptime(date_str, fmt)
-                if 2000 <= parsed.year <= 2030:
-                    return parsed
-            except:
-                continue
-        
-        month_names = r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|January|February|March|April|May|June|July|August|September|October|November|December)'
-        pattern = rf'{month_names}\s+(\d{{1,2}}),?\s+(\d{{4}})'
-        match = re.search(pattern, date_str, re.IGNORECASE)
-        if match:
-            try:
-                month_str, day, year = match.groups()
-                month_map = {
-                    'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
-                    'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12
-                }
-                month_num = month_map[month_str.upper()[:3]]
-                return datetime(int(year), month_num, int(day))
-            except:
-                pass
-        
-        return None
-    
-    @staticmethod
-    def _calculate_confidence(extracted, text):
-        confidence = 0.0
-        total_fields = 0
-        
-        if extracted["vendor_name"]:
-            total_fields += 1
-            if extracted["vendor_name"].lower() in text.lower():
-                confidence += 0.9
-            else:
-                confidence += 0.5
-        
-        if extracted["invoice_number"]:
-            total_fields += 1
-            if extracted["invoice_number"] in text:
-                confidence += 0.95
-            else:
-                confidence += 0.6
-        
-        if extracted["invoice_date"]:
-            total_fields += 1
-            confidence += 0.9
-        
-        if extracted["amount"]:
-            total_fields += 1
-            if 0 < extracted["amount"] < 1000000:
-                confidence += 0.85
-            else:
-                confidence += 0.5
-        
-        if extracted["vat_amount"]:
-            total_fields += 1
-            confidence += 0.8
-        
-        if total_fields > 0:
-            confidence = (confidence / total_fields) * 100
-        else:
-            confidence = 0
-        
-        return min(100, confidence)
-    
-    @staticmethod
-    def _get_empty_extraction():
         return {
-            "vendor_name": None,
-            "invoice_number": None,
-            "invoice_date": None,
-            "amount": None,
-            "vat_amount": None,
-            "tax_rate": None,
-            "po_number": None,
-            "due_date": None
+            **extracted,
+            "confidence": overall_confidence,
+            "field_confidences": field_confidences
         }
     
     @staticmethod
-    def _get_suggestions(extracted, confidence):
-        suggestions = []
+    def _calculate_pattern_confidence(pattern: str, match: str, full_text: str) -> float:
+        """Calculate confidence based on pattern match quality"""
+        confidence = 0.8
+        if re.match(r'^' + pattern + r'$', full_text, re.IGNORECASE):
+            confidence += 0.15
+        if len(match) < 3:
+            confidence -= 0.2
+        return min(confidence, 1.0)
+    
+    @staticmethod
+    def _calculate_overall_confidence(extracted: Dict, field_confidences: Dict) -> float:
+        """Calculate overall confidence score"""
+        field_weights = {
+            "vendor_name": 0.15,
+            "invoice_number": 0.20,
+            "invoice_date": 0.20,
+            "amount": 0.30,
+            "vat_amount": 0.15
+        }
         
-        if confidence < 50:
-            suggestions.append("Low extraction confidence. Consider manual verification.")
+        total_weight = 0
+        weighted_score = 0
         
-        if not extracted["vendor_name"]:
-            suggestions.append("Vendor name not detected. Please verify or add manually.")
+        for field, weight in field_weights.items():
+            if extracted.get(field) is not None:
+                if field in field_confidences:
+                    weighted_score += weight * field_confidences[field]
+                else:
+                    weighted_score += weight
+            total_weight += weight
         
-        if not extracted["invoice_number"]:
-            suggestions.append("Invoice number not detected. Please verify.")
+        return round(weighted_score / total_weight, 2) if total_weight > 0 else 0.0
+
+# ==================== Validation ====================
+class DataValidator:
+    """Enhanced data validation with business rules"""
+    
+    @staticmethod
+    def validate_extraction(data: Dict[str, Any]) -> Tuple[bool, List[str], Dict[str, Any]]:
+        """Validate extracted data and return validation results"""
+        errors = []
+        corrected = data.copy()
         
-        if not extracted["amount"]:
-            suggestions.append("Amount not detected. Please verify the total amount.")
+        if data.get("amount"):
+            if data["amount"] < 0:
+                errors.append("Amount cannot be negative")
+                corrected["amount"] = None
+            elif data["amount"] > 10000000:
+                errors.append(f"Amount ${data['amount']:,.2f} exceeds typical maximum")
         
-        if extracted["amount"] and not extracted["vat_amount"]:
-            suggestions.append("VAT amount not detected. Please verify tax amount.")
+        if data.get("vat_amount"):
+            if data["vat_amount"] < 0:
+                errors.append("VAT amount cannot be negative")
+                corrected["vat_amount"] = None
         
-        if extracted["invoice_date"] and extracted["invoice_date"] > datetime.now():
-            suggestions.append("Invoice date is in the future. Please verify.")
+        if data.get("amount") and data.get("vat_amount"):
+            vat_ratio = data["vat_amount"] / data["amount"]
+            if vat_ratio > 0.3:
+                errors.append(f"VAT amount (${data['vat_amount']:,.2f}) seems high for amount (${data['amount']:,.2f})")
         
-        if extracted["amount"] and extracted["amount"] > 100000:
-            suggestions.append("Large amount detected. Consider additional verification.")
+        if data.get("invoice_date"):
+            if data["invoice_date"] > datetime.now(timezone.utc):
+                errors.append("Invoice date cannot be in the future")
+                corrected["invoice_date"] = None
         
-        return suggestions
+        if data.get("vendor_name"):
+            cleaned = re.sub(r'[^a-zA-Z\s\.&]', '', data["vendor_name"])
+            if len(cleaned) < 2:
+                errors.append("Vendor name appears invalid")
+                corrected["vendor_name"] = None
+            else:
+                corrected["vendor_name"] = cleaned
+        
+        return len(errors) == 0, errors, corrected
 
 # ==================== Duplicate Detection ====================
 class DuplicateDetector:
     @staticmethod
-    def check_duplicate(db, invoice_number, vendor_name, amount, file_content, document_type):
+    def check_duplicate(db: Session, invoice_number: Optional[str], vendor_name: Optional[str],
+                        amount: Optional[float], file_content: bytes, document_type: str) -> Tuple[bool, Optional[str]]:
+        
         file_hash = hashlib.sha256(file_content).hexdigest()
         existing_file = db.query(Document).filter(Document.file_hash == file_hash).first()
         if existing_file:
@@ -596,6 +632,26 @@ class DuplicateDetector:
                 return True, f"Possible duplicate: same vendor and amount found in document #{dup.id}"
 
         return False, None
+
+# ==================== File Validation ====================
+def validate_file(file_content: bytes, filename: str) -> None:
+    if len(file_content) > Config.MAX_FILE_SIZE:
+        raise HTTPException(400, f"Max size {Config.MAX_FILE_SIZE//1024//1024}MB")
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in Config.ALLOWED_EXTENSIONS:
+        raise HTTPException(400, f"Allowed extensions: {Config.ALLOWED_EXTENSIONS}")
+    magic_map = {b'%PDF': '.pdf', b'\xff\xd8': '.jpg', b'\x89PNG': '.png'}
+    detected = None
+    for magic, ext2 in magic_map.items():
+        if file_content.startswith(magic):
+            detected = ext2
+            break
+    if detected and detected != ext:
+        raise HTTPException(400, "File extension mismatch")
+
+def generate_secure_filename(original: str) -> str:
+    ext = os.path.splitext(original)[1].lower()
+    return f"{uuid.uuid4().hex}{ext}"
 
 # ==================== Lifespan (Startup) ====================
 @asynccontextmanager
@@ -706,7 +762,6 @@ async def login(
     )
     db.add(audit)
     db.commit()
-    
     return {"access_token": token, "token_type": "bearer"}
 
 @app.post("/api/auth/logout")
@@ -747,23 +802,36 @@ async def upload_document(
     file_hash = hashlib.sha256(content).hexdigest()
     ext = os.path.splitext(file.filename)[1].lower()
     
-    if ext == ".pdf":
-        extracted, confidence = await AIExtractor.extract_from_pdf(file_path)
-    else:
-        extracted, confidence = await AIExtractor.extract_from_image(file_path)
-    
-    extracted_text_preview = ""
-    if ext == ".pdf":
-        try:
-            images = pdf2image.convert_from_path(file_path, first_page=1, last_page=1)
-            if images:
-                extracted_text_preview = pytesseract.image_to_string(images[0])[:1000]
-        except:
-            pass
+    # OCR Pipeline: Extract -> Validate -> Score Confidence
+    try:
+        if ext == ".pdf":
+            extracted = await AIExtractor.extract_from_pdf(file_path)
+        else:
+            extracted = await AIExtractor.extract_from_image(file_path)
+        
+        is_valid, validation_errors, corrected_data = DataValidator.validate_extraction(extracted)
+        
+        if not is_valid:
+            logger.warning(f"Validation warnings for {file.filename}: {validation_errors}")
+        
+    except Exception as e:
+        logger.error(f"Extraction failed for {file.filename}: {e}")
+        extracted = {
+            "vendor_name": None,
+            "invoice_number": None,
+            "invoice_date": None,
+            "amount": None,
+            "vat_amount": None,
+            "tax_rate": None,
+            "confidence": 0.0,
+            "field_confidences": {}
+        }
+        corrected_data = extracted
+        validation_errors = [f"Extraction failed: {str(e)}"]
     
     is_dup, dup_reason = DuplicateDetector.check_duplicate(
-        db, extracted.get("invoice_number"), extracted.get("vendor_name"),
-        extracted.get("amount"), content, document_type
+        db, corrected_data.get("invoice_number"), corrected_data.get("vendor_name"),
+        corrected_data.get("amount"), content, document_type
     )
     
     doc = Document(
@@ -771,18 +839,18 @@ async def upload_document(
         file_path=file_path,
         file_hash=file_hash,
         document_type=document_type,
-        vendor_name=extracted.get("vendor_name"),
-        invoice_number=extracted.get("invoice_number"),
-        invoice_date=extracted.get("invoice_date"),
-        amount=extracted.get("amount"),
-        vat_amount=extracted.get("vat_amount"),
-        tax_rate=extracted.get("tax_rate"),
+        vendor_name=corrected_data.get("vendor_name"),
+        invoice_number=corrected_data.get("invoice_number"),
+        invoice_date=corrected_data.get("invoice_date"),
+        amount=corrected_data.get("amount"),
+        vat_amount=corrected_data.get("vat_amount"),
+        tax_rate=corrected_data.get("tax_rate"),
+        extraction_confidence=extracted.get("confidence", 0.0),
         uploaded_by=current_user.id,
         status=ApprovalStatus.PENDING_LEVEL1,
         is_duplicate=is_dup,
         duplicate_reason=dup_reason,
-        extraction_confidence=confidence,
-        extracted_raw_text=extracted_text_preview
+        validation_errors="; ".join(validation_errors) if validation_errors else None
     )
     db.add(doc)
     db.commit()
@@ -791,7 +859,7 @@ async def upload_document(
     audit = AuditLog(
         user_id=current_user.id, 
         action="UPLOAD", 
-        details=f"Uploaded {file.filename} (ID: {doc.id}, Confidence: {confidence:.1f}%)", 
+        details=f"Uploaded {file.filename} (ID: {doc.id}) - Confidence: {extracted.get('confidence', 0)}", 
         ip_address=request.client.host if hasattr(request, 'client') else "unknown"
     )
     db.add(audit)
@@ -800,12 +868,15 @@ async def upload_document(
     return {
         "message": "Document uploaded",
         "document_id": doc.id,
-        "extracted_data": extracted,
-        "extraction_confidence": confidence,
+        "extracted_data": {
+            **corrected_data,
+            "confidence": extracted.get("confidence", 0),
+            "field_confidences": extracted.get("field_confidences", {})
+        },
+        "validation_warnings": validation_errors if validation_errors else None,
         "is_duplicate": is_dup,
         "duplicate_reason": dup_reason,
-        "status": doc.status.value,
-        "suggestions": AIExtractor._get_suggestions(extracted, confidence)
+        "status": doc.status.value
     }
 
 @app.get("/api/documents")
@@ -866,11 +937,12 @@ async def get_document(
             "amount": doc.amount,
             "vat_amount": doc.vat_amount,
             "tax_rate": doc.tax_rate,
+            "extraction_confidence": doc.extraction_confidence,
             "status": doc.status.value,
             "upload_date": doc.upload_date,
             "is_duplicate": doc.is_duplicate,
             "duplicate_reason": doc.duplicate_reason,
-            "extraction_confidence": doc.extraction_confidence
+            "validation_errors": doc.validation_errors
         },
         "approval_history": [
             {
@@ -883,11 +955,11 @@ async def get_document(
         ]
     }
 
-# ==================== Approval Routes ====================
+# ==================== Approval Routes (3-step) ====================
 @app.post("/api/approval/process")
 async def process_approval(
-    request: Request,
     action: ApprovalAction,
+    request: Request,
     current_user: User = Depends(role_required([UserRole.ADMIN, UserRole.APPROVER, UserRole.MANAGER])),
     db: Session = Depends(get_db)
 ):
@@ -1034,7 +1106,8 @@ async def spend_summary(
             "total_vat": total_vat,
             "total_without_vat": total_amount - total_vat,
             "document_count": len(docs),
-            "unique_vendors": len(vendor_breakdown)
+            "unique_vendors": len(vendor_breakdown),
+            "average_confidence": sum(d.extraction_confidence or 0 for d in docs) / len(docs) if docs else 0
         },
         "vendor_breakdown": vendor_breakdown,
         "monthly_trend": monthly_trend,
@@ -1046,7 +1119,8 @@ async def spend_summary(
                 "invoice_number": d.invoice_number,
                 "date": d.invoice_date,
                 "amount": d.amount,
-                "vat": d.vat_amount
+                "vat": d.vat_amount,
+                "confidence": d.extraction_confidence
             }
             for d in docs[:50]
         ]
@@ -1099,7 +1173,7 @@ async def tax_report(
         ]
     }
 
-# ==================== Export Routes ====================
+# ==================== Export Endpoints ====================
 @app.get("/api/reports/export/excel")
 async def export_excel(
     start_date: Optional[datetime] = Query(None),
@@ -1141,9 +1215,9 @@ async def export_excel(
             "Date": d.invoice_date,
             "Amount": d.amount or 0,
             "VAT Amount": d.vat_amount or 0,
+            "Extraction Confidence": d.extraction_confidence or 0,
             "Status": d.status.value,
-            "Upload Date": d.upload_date,
-            "Confidence Score": d.extraction_confidence or 0
+            "Upload Date": d.upload_date
         })
     
     df = pd.DataFrame(data)
@@ -1157,7 +1231,7 @@ async def export_excel(
                 ["Number of Documents", len(df)],
                 ["Unique Vendors", df["Vendor"].nunique()],
                 ["Average Amount", df["Amount"].mean()],
-                ["Average Confidence", df["Confidence Score"].mean()]
+                ["Average Confidence", df["Extraction Confidence"].mean()]
             ], columns=["Metric", "Value"])
             summary.to_excel(writer, sheet_name='Summary', index=False)
     
@@ -1210,7 +1284,7 @@ async def export_pdf(
     avg_confidence = sum(d.extraction_confidence or 0 for d in docs) / len(docs) if docs else 0
     elements.append(Paragraph(f"<b>Total Amount:</b> ${total_amount:,.2f}", styles['Normal']))
     elements.append(Paragraph(f"<b>Number of Documents:</b> {len(docs)}", styles['Normal']))
-    elements.append(Paragraph(f"<b>Average Extraction Confidence:</b> {avg_confidence:.1f}%", styles['Normal']))
+    elements.append(Paragraph(f"<b>Average Extraction Confidence:</b> {avg_confidence:.1%}", styles['Normal']))
     elements.append(Paragraph("<br/>", styles['Normal']))
     
     table_data = [["ID", "Vendor", "Invoice #", "Date", "Amount", "VAT", "Confidence"]]
@@ -1222,7 +1296,7 @@ async def export_pdf(
             d.invoice_date.strftime("%Y-%m-%d") if d.invoice_date else "",
             f"${d.amount:,.2f}" if d.amount else "$0.00",
             f"${d.vat_amount:,.2f}" if d.vat_amount else "$0.00",
-            f"{d.extraction_confidence:.0f}%" if d.extraction_confidence else "N/A"
+            f"{d.extraction_confidence:.1%}" if d.extraction_confidence else "N/A"
         ])
     
     table = Table(table_data)
@@ -1274,7 +1348,6 @@ async def export_tax_excel(
             "Invoice Date": d.invoice_date,
             "Taxable Amount": d.amount or 0,
             "VAT Amount": d.vat_amount or 0,
-            "Tax Rate": d.tax_rate or 0,
             "Status": d.status.value
         })
     
@@ -1428,6 +1501,10 @@ async def get_ai_insights(
     avg_amount = np.mean(amounts) if amounts else 0
     insights.append(f"💰 Average transaction amount: ${avg_amount:,.2f}")
     
+    low_conf_docs = [d for d in docs if d.extraction_confidence and d.extraction_confidence < 0.6]
+    if low_conf_docs:
+        insights.append(f"⚠️ {len(low_conf_docs)} documents have low extraction confidence (<60%) - review recommended")
+    
     if monthly_spending:
         highest_month = max(monthly_spending, key=monthly_spending.get)
         insights.append(f"📅 Highest spending month: {highest_month} (${monthly_spending[highest_month]:,.2f})")
@@ -1435,10 +1512,6 @@ async def get_ai_insights(
     total_vat = sum(d.vat_amount or 0 for d in docs)
     if total_vat > 0:
         insights.append(f"🧾 Total VAT collected: ${total_vat:,.2f}")
-    
-    low_confidence_docs = [d for d in docs if d.extraction_confidence and d.extraction_confidence < 50]
-    if low_confidence_docs:
-        insights.append(f"⚠️ {len(low_confidence_docs)} documents have low extraction confidence (<50%) - review recommended")
     
     return {
         "insights": insights,
@@ -1450,7 +1523,7 @@ async def get_ai_insights(
             "total_transactions": len(docs),
             "unique_vendors": len(vendor_spending),
             "total_vat": total_vat,
-            "average_confidence": np.mean([d.extraction_confidence for d in docs if d.extraction_confidence]) if docs else 0
+            "average_confidence": np.mean([d.extraction_confidence or 0 for d in docs])
         },
         "trends": {
             "monthly_spending": monthly_spending,
@@ -1577,20 +1650,27 @@ async def get_admin_stats(
     db: Session = Depends(get_db)
 ):
     total_docs = db.query(Document).count()
-    total_users = db.query(User).count()
-    pending_approvals = db.query(Document).filter(Document.status.in_([
-        ApprovalStatus.PENDING_LEVEL1,
-        ApprovalStatus.PENDING_LEVEL2,
-        ApprovalStatus.PENDING_LEVEL3
+    approved_docs = db.query(Document).filter(Document.status == ApprovalStatus.APPROVED).count()
+    pending_docs = db.query(Document).filter(Document.status.in_([
+        ApprovalStatus.PENDING_LEVEL1, ApprovalStatus.PENDING_LEVEL2, ApprovalStatus.PENDING_LEVEL3
     ])).count()
+    rejected_docs = db.query(Document).filter(Document.status == ApprovalStatus.REJECTED).count()
+    
     avg_confidence = db.query(func.avg(Document.extraction_confidence)).scalar() or 0
+    low_confidence_docs = db.query(Document).filter(Document.extraction_confidence < 0.6).count()
     
     return {
-        "total_documents": total_docs,
-        "total_users": total_users,
-        "pending_approvals": pending_approvals,
-        "average_extraction_confidence": round(avg_confidence, 2),
-        "database_type": Config.DATABASE_TYPE
+        "documents": {
+            "total": total_docs,
+            "approved": approved_docs,
+            "pending": pending_docs,
+            "rejected": rejected_docs
+        },
+        "extraction_quality": {
+            "average_confidence": round(avg_confidence, 2),
+            "low_confidence_count": low_confidence_docs,
+            "low_confidence_percentage": round(low_confidence_docs / total_docs * 100, 2) if total_docs > 0 else 0
+        }
     }
 
 @app.get("/health")
@@ -1598,15 +1678,10 @@ async def health():
     return {"status": "healthy", "timestamp": datetime.now(timezone.utc)}
 
 # Mount static files
-static_dir = os.getenv("STATIC_DIR", "static")
-if os.path.exists(static_dir):
-    app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
-    print(f"✅ Static files mounted from {static_dir}")
+if os.path.exists("static"):
+    app.mount("/", StaticFiles(directory="static", html=True), name="static")
 else:
-    print(f"⚠️ Static directory '{static_dir}' not found. Create this folder with your HTML files.")
-    # Create a simple static directory if it doesn't exist
-    os.makedirs(static_dir, exist_ok=True)
-    app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
+    print("⚠️ Static directory not found. Create a 'static' folder with your HTML files.")
 
 # ==================== Main ====================
 if __name__ == "__main__":
@@ -1617,7 +1692,8 @@ if __name__ == "__main__":
     print(f"🌐 Server will run on: http://0.0.0.0:{port}")
     print(f"📚 API Documentation: http://0.0.0.0:{port}/docs")
     print(f"🗄️  Database: {Config.DATABASE_TYPE.upper()}")
-    print(f"🤖 Enhanced AI Extraction: ENABLED")
+    print("=" * 60)
+    print("📋 OCR Pipeline: OCR → Clean → Structure → AI Extraction → Validation → Confidence")
     print("=" * 60)
     
     uvicorn.run(
