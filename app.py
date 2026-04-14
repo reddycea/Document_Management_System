@@ -310,6 +310,95 @@ def generate_secure_filename(original: str) -> str:
     ext = os.path.splitext(original)[1].lower()
     return f"{uuid.uuid4().hex}{ext}"
 
+def add_missing_columns():
+    """Add missing columns to the database"""
+    database_url = Config.get_database_url()
+    
+    # Handle PostgreSQL vs SQLite
+    if "postgresql" in database_url:
+        engine = create_engine(database_url)
+        with engine.connect() as conn:
+            # Check if column exists
+            result = conn.execute(text("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name='documents' AND column_name='rejection_reason'
+            """))
+            
+            if result.rowcount == 0:
+                print("Adding rejection_reason column to documents table...")
+                conn.execute(text(
+                    "ALTER TABLE documents ADD COLUMN rejection_reason TEXT"
+                ))
+                conn.commit()
+                print("✅ Column added successfully")
+            else:
+                print("✅ rejection_reason column already exists")
+                
+    elif "sqlite" in database_url:
+        # SQLite doesn't support ALTER TABLE ADD COLUMN as easily
+        # Need to recreate the table
+        engine = create_engine(database_url)
+        with engine.connect() as conn:
+            # Check if column exists
+            result = conn.execute(text(
+                "PRAGMA table_info(documents)"
+            ))
+            columns = [row[1] for row in result]
+            
+            if 'rejection_reason' not in columns:
+                print("Recreating documents table with rejection_reason column...")
+                
+                # SQLite migration approach
+                conn.execute(text("""
+                    CREATE TABLE documents_new (
+                        id INTEGER PRIMARY KEY,
+                        filename VARCHAR(255) NOT NULL,
+                        file_path VARCHAR(500) NOT NULL,
+                        file_hash VARCHAR(64) UNIQUE,
+                        document_type VARCHAR(20) NOT NULL,
+                        vendor_name VARCHAR(200),
+                        invoice_number VARCHAR(100),
+                        invoice_date DATETIME,
+                        amount FLOAT,
+                        vat_amount FLOAT,
+                        tax_rate FLOAT,
+                        upload_date DATETIME,
+                        uploaded_by INTEGER,
+                        status VARCHAR(20),
+                        is_duplicate BOOLEAN,
+                        duplicate_reason TEXT,
+                        rejection_reason TEXT,
+                        extraction_method VARCHAR(50),
+                        extraction_confidence FLOAT,
+                        openai_response TEXT,
+                        FOREIGN KEY(uploaded_by) REFERENCES users(id)
+                    )
+                """))
+                
+                # Copy data from old table
+                conn.execute(text("""
+                    INSERT INTO documents_new 
+                    SELECT id, filename, file_path, file_hash, document_type, 
+                           vendor_name, invoice_number, invoice_date, amount, 
+                           vat_amount, tax_rate, upload_date, uploaded_by, 
+                           status, is_duplicate, duplicate_reason, 
+                           NULL as rejection_reason,
+                           extraction_method, extraction_confidence, openai_response
+                    FROM documents
+                """))
+                
+                # Drop old table and rename new one
+                conn.execute(text("DROP TABLE documents"))
+                conn.execute(text("ALTER TABLE documents_new RENAME TO documents"))
+                conn.commit()
+                print("✅ Table recreated with rejection_reason column")
+            else:
+                print("✅ rejection_reason column already exists")
+    
+    else:
+        print(f"Unsupported database type: {Config.DATABASE_TYPE}")
+
 # ==================== Document Extractor ====================
 class DocumentExtractor:
     @staticmethod
@@ -1382,6 +1471,7 @@ else:
 # ==================== Main ====================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
+    add_missing_columns()
     print("=" * 60)
     print("📄 Document Management System Starting...")
     print("=" * 60)
