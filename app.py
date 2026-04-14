@@ -3,13 +3,17 @@ import re
 import io
 import uuid
 import hashlib
+import json
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 from enum import Enum
 from contextlib import asynccontextmanager
+from functools import wraps
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # FastAPI and dependencies
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Query, status, Response, Request
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Query, status, Response, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -22,20 +26,46 @@ from passlib.context import CryptContext
 
 # Document processing
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 import pdf2image
+import cv2
+import numpy as np
 
 # Data processing and reporting
 import pandas as pd
 import numpy as np
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.pagesizes import letter, landscape
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
 
 # Configuration
 from dotenv import load_dotenv
 import uvicorn
+
+# Optional AI/ML imports (commented if not available)
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+    print("⚠️ OpenAI not installed. Install with: pip install openai")
+
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+    print("⚠️ Anthropic not installed. Install with: pip install anthropic")
+
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+    AWS_AVAILABLE = True
+except ImportError:
+    AWS_AVAILABLE = False
+    print("⚠️ Boto3 not installed. Install with: pip install boto3")
 
 load_dotenv()
 
@@ -62,9 +92,9 @@ class Config:
     MYSQL_DB = os.getenv("MYSQL_DB", "doc_management")
 
     # Database selection
-    DATABASE_TYPE = os.getenv("DATABASE_TYPE", "postgresql").lower()  # postgresql, mysql, sqlite
+    DATABASE_TYPE = os.getenv("DATABASE_TYPE", "postgresql").lower()
     
-    # Render.com PostgreSQL URL (automatically provided)
+    # Render.com PostgreSQL URL
     RENDER_DATABASE_URL = os.getenv("DATABASE_URL")
     
     SQLITE_URL = "sqlite:///./doc_management.db"
@@ -73,18 +103,26 @@ class Config:
     MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 10 * 1024 * 1024))
     ALLOWED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
 
+    # AI Configuration
+    AI_EXTRACTION_MODE = os.getenv("AI_EXTRACTION_MODE", "hybrid")  # regex, aws, openai, hybrid
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+    AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY", "")
+    AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY", "")
+    AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+    
+    # Confidence threshold for hybrid mode
+    CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", 0.7))
+
     @classmethod
     def get_database_url(cls):
-        # Priority 1: Use Render.com DATABASE_URL if available (PostgreSQL)
         if cls.RENDER_DATABASE_URL:
             print(f"✅ Using Render.com PostgreSQL database")
-            # Convert postgres:// to postgresql:// for SQLAlchemy
             database_url = cls.RENDER_DATABASE_URL
             if database_url.startswith("postgres://"):
                 database_url = database_url.replace("postgres://", "postgresql://", 1)
             return database_url
         
-        # Priority 2: Use specified DATABASE_TYPE
         if cls.DATABASE_TYPE == "postgresql":
             print(f"✅ Using PostgreSQL database at {cls.PG_HOST}:{cls.PG_PORT}")
             return f"postgresql://{cls.PG_USER}:{cls.PG_PASSWORD}@{cls.PG_HOST}:{cls.PG_PORT}/{cls.PG_DB}"
@@ -110,6 +148,12 @@ class ApprovalStatus(str, Enum):
     PENDING_LEVEL3 = "PENDING_LEVEL3"
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
+
+class ExtractionMethod(str, Enum):
+    REGEX = "regex"
+    AWS_TEXTRACT = "aws_textract"
+    OPENAI_VISION = "openai_vision"
+    HYBRID = "hybrid"
 
 class User(Base):
     __tablename__ = "users"
@@ -140,6 +184,9 @@ class Document(Base):
     status = Column(SQLEnum(ApprovalStatus), default=ApprovalStatus.PENDING_LEVEL1)
     is_duplicate = Column(Boolean, default=False)
     duplicate_reason = Column(Text)
+    extraction_method = Column(String(50), default="regex")
+    extraction_confidence = Column(Float, default=0.0)
+    raw_extracted_text = Column(Text)
     uploader = relationship("User")
 
 class Approval(Base):
@@ -169,7 +216,6 @@ try:
     database_url = Config.get_database_url()
 
     if "postgresql" in database_url:
-        # PostgreSQL specific configuration
         engine = create_engine(
             database_url,
             pool_pre_ping=True,
@@ -178,7 +224,7 @@ try:
             pool_recycle=3600,
             echo=False
         )
-    else:  # MySQL
+    else:
         engine = create_engine(
             database_url, 
             pool_pre_ping=True,
@@ -235,6 +281,16 @@ class ReportFilter(BaseModel):
     min_amount: Optional[float] = None
     max_amount: Optional[float] = None
 
+class ExtractionResult(BaseModel):
+    vendor_name: Optional[str]
+    invoice_number: Optional[str]
+    invoice_date: Optional[datetime]
+    amount: Optional[float]
+    vat_amount: Optional[float]
+    confidence: float
+    method: str
+    raw_text: Optional[str] = None
+
 # ==================== Authentication ====================
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer(auto_error=False)
@@ -282,7 +338,7 @@ def role_required(required_roles: List[UserRole]):
         return current_user
     return checker
 
-# ==================== File Validation ====================
+# ==================== Enhanced File Validation ====================
 def validate_file(file_content: bytes, filename: str) -> None:
     if len(file_content) > Config.MAX_FILE_SIZE:
         raise HTTPException(400, f"Max size {Config.MAX_FILE_SIZE//1024//1024}MB")
@@ -302,30 +358,65 @@ def generate_secure_filename(original: str) -> str:
     ext = os.path.splitext(original)[1].lower()
     return f"{uuid.uuid4().hex}{ext}"
 
-# ==================== AI Document Extractor ====================
-class AIExtractor:
+# ==================== Image Preprocessing for Better OCR ====================
+class ImagePreprocessor:
     @staticmethod
-    async def extract_from_image(image_path: str) -> Dict[str, Any]:
+    def preprocess_image(image_path: str) -> str:
+        """Apply image preprocessing to improve OCR accuracy"""
         try:
-            image = Image.open(image_path)
-            text = pytesseract.image_to_string(image)
-            return AIExtractor._parse_document_text(text)
+            # Read image
+            image = cv2.imread(image_path)
+            if image is None:
+                return image_path
+            
+            # Convert to grayscale
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            
+            # Denoise
+            denoised = cv2.fastNlMeansDenoising(gray, h=30)
+            
+            # Increase contrast using CLAHE
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            enhanced = clahe.apply(denoised)
+            
+            # Binarization with Otsu's method
+            _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            # Save preprocessed image
+            preprocessed_path = image_path.replace('.', '_preprocessed.')
+            cv2.imwrite(preprocessed_path, binary)
+            
+            return preprocessed_path
         except Exception as e:
-            print(f"OCR error: {e}")
-            return AIExtractor._get_empty_extraction()
+            print(f"Preprocessing error: {e}")
+            return image_path
     
     @staticmethod
-    async def extract_from_pdf(pdf_path: str) -> Dict[str, Any]:
-        try:
-            images = pdf2image.convert_from_path(pdf_path, first_page=1, last_page=3)
-            text = "".join(pytesseract.image_to_string(img) for img in images)
-            return AIExtractor._parse_document_text(text)
-        except Exception as e:
-            print(f"PDF extraction error: {e}")
-            return AIExtractor._get_empty_extraction()
+    def preprocess_pil_image(image: Image.Image) -> Image.Image:
+        """Preprocess PIL image for better OCR"""
+        # Convert to grayscale
+        if image.mode != 'L':
+            image = image.convert('L')
+        
+        # Enhance contrast
+        enhancer = ImageEnhance.Contrast(image)
+        image = enhancer.enhance(2.0)
+        
+        # Sharpen
+        enhancer = ImageEnhance.Sharpness(image)
+        image = enhancer.enhance(1.5)
+        
+        # Apply threshold
+        image = image.point(lambda x: 0 if x < 128 else 255, '1')
+        
+        return image
+
+# ==================== Advanced AI Document Extractor ====================
+class RegexExtractor:
+    """Fast regex-based extraction for standard invoices"""
     
     @staticmethod
-    def _parse_document_text(text: str) -> Dict[str, Any]:
+    async def extract_from_text(text: str) -> Dict[str, Any]:
         data = {
             "vendor_name": None,
             "invoice_number": None,
@@ -333,35 +424,42 @@ class AIExtractor:
             "amount": None,
             "vat_amount": None
         }
+        
         patterns = {
             "vendor_name": [
                 r"(?:Vendor|Supplier|Company|Bill From|Seller|Issuer)[\s:]+([A-Za-z0-9\s&.,]+)(?:\n|$)",
+                r"^(?:From|Seller|Vendor):\s*([A-Za-z0-9\s&.,]+)(?:\n|$)",
                 r"^([A-Za-z0-9\s&.,]+)(?:\n|$)"
             ],
             "invoice_number": [
                 r"(?:Invoice|Document|Bill)[\s#:]+(\S+)",
-                r"(?:INV|INVOICE)[\s-]*(\d+)"
+                r"(?:INV|INVOICE)[\s-]*(\d+)",
+                r"Invoice Number:\s*(\S+)"
             ],
             "invoice_date": [
                 r"(?:Date|Invoice Date|Issue Date)[\s:]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-                r"(\d{4}-\d{2}-\d{2})"
+                r"(\d{4}-\d{2}-\d{2})",
+                r"(?:Date|Issued):\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
             ],
             "amount": [
                 r"(?:Total|Amount Due|Grand Total|Balance Due)[\s:]*[$]?([\d,]+\.?\d*)",
-                r"TOTAL\s+[$]?([\d,]+\.?\d*)"
+                r"TOTAL\s+[$]?([\d,]+\.?\d*)",
+                r"Amount\s+Due:\s*[$]?([\d,]+\.?\d*)"
             ],
             "vat_amount": [
                 r"(?:VAT|Tax|GST|HST)[\s:]*[$]?([\d,]+\.?\d*)",
-                r"Tax Amount\s+[$]?([\d,]+\.?\d*)"
+                r"Tax Amount\s+[$]?([\d,]+\.?\d*)",
+                r"(?:VAT|GST)\s+(\d+(?:\.\d+)?%)"
             ]
         }
+        
         for key, pats in patterns.items():
             for pat in pats:
-                m = re.search(pat, text, re.IGNORECASE)
+                m = re.search(pat, text, re.IGNORECASE | re.MULTILINE)
                 if m:
                     val = m.group(1).strip()
                     if key == "invoice_date":
-                        for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d"):
+                        for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d", "%m-%d-%Y", "%d-%m-%Y"):
                             try:
                                 data[key] = datetime.strptime(val, fmt)
                                 break
@@ -369,19 +467,308 @@ class AIExtractor:
                                 pass
                     elif key in ("amount", "vat_amount"):
                         try:
+                            # Remove currency symbols and commas
+                            val = re.sub(r'[^\d.,-]', '', val)
                             data[key] = float(val.replace(",", ""))
                         except:
                             pass
                     else:
                         data[key] = val
                     break
-        return data
+        
+        # Calculate confidence
+        confidence = RegexExtractor.calculate_confidence(data)
+        
+        return {**data, "confidence": confidence, "method": "regex"}
     
     @staticmethod
-    def _get_empty_extraction():
-        return {"vendor_name": None, "invoice_number": None, "invoice_date": None, "amount": None, "vat_amount": None}
+    def calculate_confidence(data: Dict) -> float:
+        confidence = 0.0
+        weights = {
+            "vendor_name": 0.2,
+            "invoice_number": 0.25,
+            "invoice_date": 0.2,
+            "amount": 0.35
+        }
+        
+        for field, weight in weights.items():
+            if data.get(field):
+                confidence += weight
+        
+        # Bonus for having both amount and VAT
+        if data.get("amount") and data.get("vat_amount"):
+            confidence += 0.1
+        
+        return min(confidence, 1.0)
 
-# ==================== Duplicate Detection ====================
+class AWSExpertExtractor:
+    """AWS Textract for advanced document extraction"""
+    
+    @staticmethod
+    async def extract_from_image(image_path: str) -> Dict[str, Any]:
+        if not AWS_AVAILABLE:
+            return await RegexExtractor.extract_from_text("")
+        
+        try:
+            client = boto3.client(
+                'textract',
+                aws_access_key_id=Config.AWS_ACCESS_KEY,
+                aws_secret_access_key=Config.AWS_SECRET_KEY,
+                region_name=Config.AWS_REGION
+            )
+            
+            with open(image_path, 'rb') as f:
+                response = client.analyze_document(
+                    Document={'Bytes': f.read()},
+                    FeatureTypes=['FORMS', 'TABLES']
+                )
+            
+            extracted = {
+                "vendor_name": None,
+                "invoice_number": None,
+                "invoice_date": None,
+                "amount": None,
+                "vat_amount": None
+            }
+            
+            # Extract key-value pairs
+            key_map = {}
+            value_map = {}
+            block_map = {}
+            
+            for block in response['Blocks']:
+                block_map[block['Id']] = block
+                if block['BlockType'] == 'KEY_VALUE_SET':
+                    if 'KEY' in block['EntityTypes']:
+                        key_map[block['Id']] = block
+                    else:
+                        value_map[block['Id']] = block
+            
+            # Map keys to values
+            for key_id, key_block in key_map.items():
+                key_text = AWSExpertExtractor.get_text(block_map, key_block)
+                if 'Relationships' in key_block:
+                    for rel in key_block['Relationships']:
+                        if rel['Type'] == 'VALUE':
+                            for value_id in rel['Ids']:
+                                if value_id in value_map:
+                                    value_text = AWSExpertExtractor.get_text(block_map, value_map[value_id])
+                                    
+                                    # Map to fields
+                                    key_lower = key_text.lower()
+                                    if 'vendor' in key_lower or 'supplier' in key_lower:
+                                        extracted['vendor_name'] = value_text
+                                    elif 'invoice' in key_lower and ('number' in key_lower or 'id' in key_lower):
+                                        extracted['invoice_number'] = value_text
+                                    elif 'date' in key_lower:
+                                        extracted['invoice_date'] = AWSExpertExtractor.parse_date(value_text)
+                                    elif 'total' in key_lower or 'amount' in key_lower:
+                                        extracted['amount'] = AWSExpertExtractor.parse_amount(value_text)
+                                    elif 'tax' in key_lower or 'vat' in key_lower or 'gst' in key_lower:
+                                        extracted['vat_amount'] = AWSExpertExtractor.parse_amount(value_text)
+            
+            confidence = 0.9 if any([extracted['vendor_name'], extracted['amount']]) else 0.5
+            
+            return {**extracted, "confidence": confidence, "method": "aws_textract"}
+            
+        except Exception as e:
+            print(f"AWS Textract error: {e}")
+            return await RegexExtractor.extract_from_text("")
+    
+    @staticmethod
+    def get_text(block_map, block):
+        text = ''
+        if 'Relationships' in block:
+            for rel in block['Relationships']:
+                if rel['Type'] == 'CHILD':
+                    for child_id in rel['Ids']:
+                        word = block_map[child_id]
+                        if word['BlockType'] == 'WORD':
+                            text += word['Text'] + ' '
+                        if word['BlockType'] == 'SELECTION_ELEMENT':
+                            if word['SelectionStatus'] == 'SELECTED':
+                                text += 'X '
+        return text.strip()
+    
+    @staticmethod
+    def parse_date(date_str: str) -> Optional[datetime]:
+        for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d", "%m-%d-%Y", "%d-%m-%Y"):
+            try:
+                return datetime.strptime(date_str, fmt)
+            except:
+                pass
+        return None
+    
+    @staticmethod
+    def parse_amount(amount_str: str) -> Optional[float]:
+        try:
+            amount_str = re.sub(r'[^\d.,-]', '', amount_str)
+            return float(amount_str.replace(",", ""))
+        except:
+            return None
+
+class OpenAIVisionExtractor:
+    """GPT-4 Vision API for high-accuracy extraction"""
+    
+    @staticmethod
+    async def extract_from_image(image_path: str) -> Dict[str, Any]:
+        if not OPENAI_AVAILABLE or not Config.OPENAI_API_KEY:
+            return await RegexExtractor.extract_from_text("")
+        
+        try:
+            openai.api_key = Config.OPENAI_API_KEY
+            
+            # Convert image to base64
+            with open(image_path, "rb") as f:
+                image_data = base64.b64encode(f.read()).decode()
+            
+            response = openai.ChatCompletion.create(
+                model="gpt-4-vision-preview",
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": """Extract the following information from this invoice document. 
+                            Return ONLY a JSON object with these fields:
+                            {
+                                "vendor_name": "company name",
+                                "invoice_number": "invoice number",
+                                "invoice_date": "YYYY-MM-DD",
+                                "amount": 0.00,
+                                "vat_amount": 0.00
+                            }
+                            If a field is not found, set it to null."""
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": f"data:image/jpeg;base64,{image_data}"
+                        }
+                    ]
+                }],
+                max_tokens=500,
+                temperature=0.1
+            )
+            
+            # Parse JSON response
+            result_text = response.choices[0].message.content
+            result_text = re.sub(r'```json\n?', '', result_text)
+            result_text = re.sub(r'```\n?', '', result_text)
+            
+            data = json.loads(result_text)
+            
+            # Parse date if string
+            if data.get('invoice_date') and isinstance(data['invoice_date'], str):
+                try:
+                    data['invoice_date'] = datetime.strptime(data['invoice_date'], '%Y-%m-%d')
+                except:
+                    data['invoice_date'] = None
+            
+            confidence = 0.95  # GPT-4 Vision is highly accurate
+            
+            return {**data, "confidence": confidence, "method": "openai_vision"}
+            
+        except Exception as e:
+            print(f"OpenAI Vision error: {e}")
+            return await RegexExtractor.extract_from_text("")
+
+class HybridExtractor:
+    """Combines multiple extraction methods for best results"""
+    
+    @staticmethod
+    async def smart_extract(file_path: str, document_type: str) -> ExtractionResult:
+        # Step 1: Extract text from document
+        raw_text = await HybridExtractor.extract_text_from_file(file_path)
+        
+        # Step 2: Try regex extraction first (fast)
+        regex_result = await RegexExtractor.extract_from_text(raw_text)
+        
+        # Step 3: Check if confidence is high enough
+        if regex_result['confidence'] >= Config.CONFIDENCE_THRESHOLD:
+            return ExtractionResult(
+                **regex_result,
+                raw_text=raw_text[:1000]  # Store first 1000 chars
+            )
+        
+        # Step 4: Try AWS Textract if available (medium cost, good accuracy)
+        if Config.AI_EXTRACTION_MODE in ["aws", "hybrid"] and AWS_AVAILABLE:
+            # Convert PDF to image if needed
+            image_path = await HybridExtractor.convert_to_image(file_path)
+            if image_path:
+                aws_result = await AWSExpertExtractor.extract_from_image(image_path)
+                if aws_result['confidence'] >= Config.CONFIDENCE_THRESHOLD:
+                    return ExtractionResult(
+                        **aws_result,
+                        raw_text=raw_text[:1000]
+                    )
+        
+        # Step 5: Try OpenAI Vision if available (higher cost, highest accuracy)
+        if Config.AI_EXTRACTION_MODE in ["openai", "hybrid"] and OPENAI_AVAILABLE and Config.OPENAI_API_KEY:
+            image_path = await HybridExtractor.convert_to_image(file_path)
+            if image_path:
+                openai_result = await OpenAIVisionExtractor.extract_from_image(image_path)
+                if openai_result['confidence'] >= Config.CONFIDENCE_THRESHOLD:
+                    return ExtractionResult(
+                        **openai_result,
+                        raw_text=raw_text[:1000]
+                    )
+        
+        # Step 6: Fallback to regex result even with low confidence
+        return ExtractionResult(
+            **regex_result,
+            raw_text=raw_text[:1000]
+        )
+    
+    @staticmethod
+    async def extract_text_from_file(file_path: str) -> str:
+        """Extract raw text from PDF or image"""
+        ext = os.path.splitext(file_path)[1].lower()
+        
+        if ext == '.pdf':
+            try:
+                images = pdf2image.convert_from_path(file_path, first_page=1, last_page=3)
+                text = ""
+                for img in images:
+                    # Preprocess image
+                    img = ImagePreprocessor.preprocess_pil_image(img)
+                    text += pytesseract.image_to_string(img)
+                return text
+            except Exception as e:
+                print(f"PDF text extraction error: {e}")
+                return ""
+        else:
+            try:
+                # Preprocess image
+                preprocessed_path = ImagePreprocessor.preprocess_image(file_path)
+                image = Image.open(preprocessed_path)
+                text = pytesseract.image_to_string(image)
+                # Clean up preprocessed file
+                if preprocessed_path != file_path and os.path.exists(preprocessed_path):
+                    os.remove(preprocessed_path)
+                return text
+            except Exception as e:
+                print(f"Image text extraction error: {e}")
+                return ""
+    
+    @staticmethod
+    async def convert_to_image(file_path: str) -> Optional[str]:
+        """Convert document to image for vision APIs"""
+        ext = os.path.splitext(file_path)[1].lower()
+        
+        if ext == '.pdf':
+            try:
+                images = pdf2image.convert_from_path(file_path, first_page=1, last_page=1)
+                if images:
+                    image_path = file_path.replace('.pdf', '.jpg')
+                    images[0].save(image_path, 'JPEG')
+                    return image_path
+            except Exception as e:
+                print(f"PDF to image conversion error: {e}")
+                return None
+        else:
+            return file_path
+
+# ==================== Enhanced Duplicate Detection ====================
 class DuplicateDetector:
     @staticmethod
     def check_duplicate(db: Session, invoice_number: Optional[str], vendor_name: Optional[str],
@@ -416,11 +803,37 @@ class DuplicateDetector:
 
         return False, None
 
+# ==================== Background Tasks ====================
+async def process_document_background(document_id: int, file_path: str, document_type: str, db: Session):
+    """Background task for advanced document processing"""
+    try:
+        # Perform advanced extraction if needed
+        result = await HybridExtractor.smart_extract(file_path, document_type)
+        
+        # Update document with extraction results
+        doc = db.query(Document).filter(Document.id == document_id).first()
+        if doc:
+            doc.vendor_name = result.vendor_name
+            doc.invoice_number = result.invoice_number
+            doc.invoice_date = result.invoice_date
+            doc.amount = result.amount
+            doc.vat_amount = result.vat_amount
+            doc.extraction_method = result.method
+            doc.extraction_confidence = result.confidence
+            doc.raw_extracted_text = result.raw_text
+            db.commit()
+            
+            print(f"✅ Background processing complete for document {document_id} using {result.method}")
+    except Exception as e:
+        print(f"❌ Background processing error for document {document_id}: {e}")
+
 # ==================== Lifespan (Startup) ====================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("🚀 Starting Document Management System...")
     print(f"📊 Database Type: {Config.DATABASE_TYPE}")
+    print(f"🤖 AI Extraction Mode: {Config.AI_EXTRACTION_MODE}")
+    print(f"🎯 Confidence Threshold: {Config.CONFIDENCE_THRESHOLD}")
     
     # Create tables
     if engine:
@@ -474,9 +887,9 @@ async def lifespan(app: FastAPI):
 
 # ==================== FastAPI App ====================
 app = FastAPI(
-    title="DocManager", 
-    version="3.0", 
-    description="Document Management System with OCR, Approval Workflow, and Analytics",
+    title="DocManager AI", 
+    version="4.0", 
+    description="AI-Powered Document Management System with OCR, Approval Workflow, and Analytics",
     lifespan=lifespan
 )
 
@@ -530,9 +943,8 @@ async def login(
     )
     db.add(audit)
     db.commit()
-    return {
-    "access_token": token, "token_type": "bearer"
-}
+    
+    return {"access_token": token, "token_type": "bearer"}
 
 @app.post("/api/auth/logout")
 async def logout(response: Response):
@@ -549,10 +961,11 @@ async def get_current_user_info(current_user: User = Depends(get_current_user)):
         "role": current_user.role.value
     }
 
-# ==================== Document Routes ====================
+# ==================== Enhanced Document Routes ====================
 @app.post("/api/documents/upload")
 async def upload_document(
     request: Request,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     document_type: str = Form(...),
     current_user: User = Depends(role_required([UserRole.ADMIN, UserRole.APPROVER, UserRole.MANAGER])),
@@ -570,16 +983,14 @@ async def upload_document(
         f.write(content)
     
     file_hash = hashlib.sha256(content).hexdigest()
-    ext = os.path.splitext(file.filename)[1].lower()
     
-    if ext == ".pdf":
-        extracted = await AIExtractor.extract_from_pdf(file_path)
-    else:
-        extracted = await AIExtractor.extract_from_image(file_path)
+    # Extract with hybrid approach
+    extraction_result = await HybridExtractor.smart_extract(file_path, document_type)
     
+    # Check for duplicates
     is_dup, dup_reason = DuplicateDetector.check_duplicate(
-        db, extracted.get("invoice_number"), extracted.get("vendor_name"),
-        extracted.get("amount"), content, document_type
+        db, extraction_result.invoice_number, extraction_result.vendor_name,
+        extraction_result.amount, content, document_type
     )
     
     doc = Document(
@@ -587,15 +998,18 @@ async def upload_document(
         file_path=file_path,
         file_hash=file_hash,
         document_type=document_type,
-        vendor_name=extracted.get("vendor_name"),
-        invoice_number=extracted.get("invoice_number"),
-        invoice_date=extracted.get("invoice_date"),
-        amount=extracted.get("amount"),
-        vat_amount=extracted.get("vat_amount"),
+        vendor_name=extraction_result.vendor_name,
+        invoice_number=extraction_result.invoice_number,
+        invoice_date=extraction_result.invoice_date,
+        amount=extraction_result.amount,
+        vat_amount=extraction_result.vat_amount,
         uploaded_by=current_user.id,
         status=ApprovalStatus.PENDING_LEVEL1,
         is_duplicate=is_dup,
-        duplicate_reason=dup_reason
+        duplicate_reason=dup_reason,
+        extraction_method=extraction_result.method,
+        extraction_confidence=extraction_result.confidence,
+        raw_extracted_text=extraction_result.raw_text
     )
     db.add(doc)
     db.commit()
@@ -605,16 +1019,28 @@ async def upload_document(
     audit = AuditLog(
         user_id=current_user.id, 
         action="UPLOAD", 
-        details=f"Uploaded {file.filename} (ID: {doc.id})", 
+        details=f"Uploaded {file.filename} (ID: {doc.id}) using {extraction_result.method} extraction", 
         ip_address=request.client.host if hasattr(request, 'client') else "unknown"
     )
     db.add(audit)
     db.commit()
     
+    # Trigger background processing for advanced features if confidence is low
+    if extraction_result.confidence < Config.CONFIDENCE_THRESHOLD:
+        background_tasks.add_task(process_document_background, doc.id, file_path, document_type, db)
+    
     return {
         "message": "Document uploaded",
         "document_id": doc.id,
-        "extracted_data": extracted,
+        "extracted_data": {
+            "vendor_name": extraction_result.vendor_name,
+            "invoice_number": extraction_result.invoice_number,
+            "invoice_date": extraction_result.invoice_date,
+            "amount": extraction_result.amount,
+            "vat_amount": extraction_result.vat_amount
+        },
+        "extraction_method": extraction_result.method,
+        "extraction_confidence": extraction_result.confidence,
         "is_duplicate": is_dup,
         "duplicate_reason": dup_reason,
         "status": doc.status.value
@@ -646,7 +1072,9 @@ async def list_documents(
             "amount": d.amount,
             "status": d.status.value,
             "upload_date": d.upload_date,
-            "is_duplicate": d.is_duplicate
+            "is_duplicate": d.is_duplicate,
+            "extraction_method": d.extraction_method,
+            "extraction_confidence": d.extraction_confidence
         }
         for d in docs
     ]
@@ -679,7 +1107,9 @@ async def get_document(
             "status": doc.status.value,
             "upload_date": doc.upload_date,
             "is_duplicate": doc.is_duplicate,
-            "duplicate_reason": doc.duplicate_reason
+            "duplicate_reason": doc.duplicate_reason,
+            "extraction_method": doc.extraction_method,
+            "extraction_confidence": doc.extraction_confidence
         },
         "approval_history": [
             {
@@ -690,6 +1120,51 @@ async def get_document(
             }
             for a in approvals
         ]
+    }
+
+# ==================== AI Enhancement Routes ====================
+@app.post("/api/documents/{document_id}/reprocess")
+async def reprocess_document(
+    document_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(role_required([UserRole.ADMIN])),
+    db: Session = Depends(get_db)
+):
+    """Manually trigger reprocessing of a document with better AI extraction"""
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    if not doc:
+        raise HTTPException(404, "Document not found")
+    
+    background_tasks.add_task(process_document_background, doc.id, doc.file_path, doc.document_type, db)
+    
+    return {
+        "message": f"Document {document_id} queued for reprocessing",
+        "document_id": document_id
+    }
+
+@app.get("/api/system/extraction-stats")
+async def get_extraction_stats(
+    current_user: User = Depends(role_required([UserRole.ADMIN])),
+    db: Session = Depends(get_db)
+):
+    """Get statistics about extraction methods and confidence"""
+    stats = db.query(
+        Document.extraction_method,
+        func.count(Document.id).label('count'),
+        func.avg(Document.extraction_confidence).label('avg_confidence')
+    ).group_by(Document.extraction_method).all()
+    
+    return {
+        "extraction_stats": [
+            {
+                "method": stat[0],
+                "count": stat[1],
+                "avg_confidence": float(stat[2]) if stat[2] else 0
+            }
+            for stat in stats
+        ],
+        "total_documents": db.query(Document).count(),
+        "low_confidence_documents": db.query(Document).filter(Document.extraction_confidence < Config.CONFIDENCE_THRESHOLD).count()
     }
 
 # ==================== Approval Routes (3-step) ====================
@@ -783,7 +1258,8 @@ async def get_pending_approvals(
             "vendor_name": d.vendor_name,
             "amount": d.amount,
             "status": d.status.value,
-            "upload_date": d.upload_date
+            "upload_date": d.upload_date,
+            "extraction_confidence": d.extraction_confidence
         }
         for d in docs
     ]
@@ -855,7 +1331,8 @@ async def spend_summary(
                 "invoice_number": d.invoice_number,
                 "date": d.invoice_date,
                 "amount": d.amount,
-                "vat": d.vat_amount
+                "vat": d.vat_amount,
+                "confidence": d.extraction_confidence
             }
             for d in docs[:50]
         ]
@@ -908,7 +1385,7 @@ async def tax_report(
         ]
     }
 
-# Export endpoints
+# Export endpoints (Excel and PDF - same as original but can be enhanced)
 @app.get("/api/reports/export/excel")
 async def export_excel(
     start_date: Optional[datetime] = Query(None),
@@ -951,7 +1428,9 @@ async def export_excel(
             "Amount": d.amount or 0,
             "VAT Amount": d.vat_amount or 0,
             "Status": d.status.value,
-            "Upload Date": d.upload_date
+            "Upload Date": d.upload_date,
+            "Extraction Method": d.extraction_method,
+            "Extraction Confidence": f"{d.extraction_confidence*100:.1f}%" if d.extraction_confidence else "N/A"
         })
     
     df = pd.DataFrame(data)
@@ -964,7 +1443,8 @@ async def export_excel(
                 ["Total VAT", df["VAT Amount"].sum()],
                 ["Number of Documents", len(df)],
                 ["Unique Vendors", df["Vendor"].nunique()],
-                ["Average Amount", df["Amount"].mean()]
+                ["Average Amount", df["Amount"].mean()],
+                ["Average Confidence", df["Extraction Confidence"].str.rstrip('%').astype(float).mean() if 'Extraction Confidence' in df else "N/A"]
             ], columns=["Metric", "Value"])
             summary.to_excel(writer, sheet_name='Summary', index=False)
     
@@ -1006,19 +1486,19 @@ async def export_pdf(
 
     docs = query.limit(100).all()
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(letter))
     styles = getSampleStyleSheet()
     elements = []
     title = Paragraph(f"Document Management Report - {datetime.now().strftime('%Y-%m-%d')}", styles['Title'])
     elements.append(title)
-    elements.append(Paragraph("<br/><br/>", styles['Normal']))
+    elements.append(Spacer(1, 12))
     
     total_amount = sum(d.amount or 0 for d in docs)
     elements.append(Paragraph(f"<b>Total Amount:</b> ${total_amount:,.2f}", styles['Normal']))
     elements.append(Paragraph(f"<b>Number of Documents:</b> {len(docs)}", styles['Normal']))
-    elements.append(Paragraph("<br/>", styles['Normal']))
+    elements.append(Spacer(1, 12))
     
-    table_data = [["ID", "Vendor", "Invoice #", "Date", "Amount", "VAT"]]
+    table_data = [["ID", "Vendor", "Invoice #", "Date", "Amount", "VAT", "Confidence"]]
     for d in docs:
         table_data.append([
             str(d.id),
@@ -1026,7 +1506,8 @@ async def export_pdf(
             (d.invoice_number or "")[:20],
             d.invoice_date.strftime("%Y-%m-%d") if d.invoice_date else "",
             f"${d.amount:,.2f}" if d.amount else "$0.00",
-            f"${d.vat_amount:,.2f}" if d.vat_amount else "$0.00"
+            f"${d.vat_amount:,.2f}" if d.vat_amount else "$0.00",
+            f"{d.extraction_confidence*100:.0f}%" if d.extraction_confidence else "N/A"
         ])
     
     table = Table(table_data)
@@ -1049,124 +1530,6 @@ async def export_pdf(
         buffer,
         media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename=report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"}
-    )
-
-# Tax export endpoints
-@app.get("/api/reports/export/tax-excel")
-async def export_tax_excel(
-    start_date: Optional[datetime] = Query(None),
-    end_date: Optional[datetime] = Query(None),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    if current_user.role == UserRole.VIEWER:
-        query = db.query(Document).filter(Document.status == ApprovalStatus.APPROVED)
-    else:
-        query = db.query(Document)
-    
-    if start_date:
-        query = query.filter(Document.invoice_date >= start_date)
-    if end_date:
-        query = query.filter(Document.invoice_date <= end_date)
-    
-    docs = query.all()
-    data = []
-    for d in docs:
-        data.append({
-            "Document ID": d.id,
-            "Vendor": d.vendor_name or "",
-            "Invoice Number": d.invoice_number or "",
-            "Invoice Date": d.invoice_date,
-            "Taxable Amount": d.amount or 0,
-            "VAT Amount": d.vat_amount or 0,
-            "Status": d.status.value
-        })
-    
-    df = pd.DataFrame(data)
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, sheet_name='Tax Report', index=False)
-        if data:
-            summary = pd.DataFrame([
-                ["Total Taxable Amount", df["Taxable Amount"].sum()],
-                ["Total VAT Collected", df["VAT Amount"].sum()],
-                ["Number of Transactions", len(df)],
-                ["Effective Tax Rate", f"{(df['VAT Amount'].sum() / df['Taxable Amount'].sum() * 100) if df['Taxable Amount'].sum() > 0 else 0:.2f}%"]
-            ], columns=["Metric", "Value"])
-            summary.to_excel(writer, sheet_name='Summary', index=False)
-    
-    output.seek(0)
-    return StreamingResponse(
-        output,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename=tax_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"}
-    )
-
-@app.get("/api/reports/export/tax-pdf")
-async def export_tax_pdf(
-    start_date: Optional[datetime] = Query(None),
-    end_date: Optional[datetime] = Query(None),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    if current_user.role == UserRole.VIEWER:
-        query = db.query(Document).filter(Document.status == ApprovalStatus.APPROVED)
-    else:
-        query = db.query(Document)
-    
-    if start_date:
-        query = query.filter(Document.invoice_date >= start_date)
-    if end_date:
-        query = query.filter(Document.invoice_date <= end_date)
-    
-    docs = query.limit(100).all()
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter)
-    styles = getSampleStyleSheet()
-    elements = []
-    title = Paragraph(f"Tax / VAT Report - {datetime.now().strftime('%Y-%m-%d')}", styles['Title'])
-    elements.append(title)
-    elements.append(Paragraph("<br/><br/>", styles['Normal']))
-    
-    total_taxable = sum(d.amount or 0 for d in docs)
-    total_vat = sum(d.vat_amount or 0 for d in docs)
-    elements.append(Paragraph(f"<b>Total Taxable Amount:</b> ${total_taxable:,.2f}", styles['Normal']))
-    elements.append(Paragraph(f"<b>Total VAT Collected:</b> ${total_vat:,.2f}", styles['Normal']))
-    elements.append(Paragraph(f"<b>Effective Tax Rate:</b> {(total_vat / total_taxable * 100) if total_taxable > 0 else 0:.2f}%", styles['Normal']))
-    elements.append(Paragraph(f"<b>Number of Transactions:</b> {len(docs)}", styles['Normal']))
-    elements.append(Paragraph("<br/>", styles['Normal']))
-    
-    table_data = [["ID", "Vendor", "Invoice #", "Date", "Taxable Amount", "VAT Amount"]]
-    for d in docs:
-        table_data.append([
-            str(d.id),
-            (d.vendor_name or "")[:30],
-            (d.invoice_number or "")[:20],
-            d.invoice_date.strftime("%Y-%m-%d") if d.invoice_date else "",
-            f"${d.amount:,.2f}" if d.amount else "$0.00",
-            f"${d.vat_amount:,.2f}" if d.vat_amount else "$0.00"
-        ])
-    
-    table = Table(table_data)
-    table.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,0), colors.grey),
-        ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
-        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0,0), (-1,0), 10),
-        ('BOTTOMPADDING', (0,0), (-1,0), 12),
-        ('BACKGROUND', (0,1), (-1,-1), colors.beige),
-        ('GRID', (0,0), (-1,-1), 1, colors.black),
-        ('FONTSIZE', (0,1), (-1,-1), 8),
-    ]))
-    elements.append(table)
-    doc.build(elements)
-    buffer.seek(0)
-    
-    return StreamingResponse(
-        buffer,
-        media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename=tax_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"}
     )
 
 # ==================== Analytics Routes ====================
@@ -1238,6 +1601,11 @@ async def get_ai_insights(
     total_vat = sum(d.vat_amount or 0 for d in docs)
     if total_vat > 0:
         insights.append(f"🧾 Total VAT collected: ${total_vat:,.2f}")
+    
+    # Add extraction quality insight
+    low_conf_docs = [d for d in docs if d.extraction_confidence and d.extraction_confidence < 0.7]
+    if low_conf_docs:
+        insights.append(f"⚠️ {len(low_conf_docs)} documents have low extraction confidence (<70%). Consider reviewing them.")
     
     return {
         "insights": insights,
@@ -1371,23 +1739,31 @@ async def get_audit_logs(
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "timestamp": datetime.now(timezone.utc)}
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now(timezone.utc),
+        "ai_mode": Config.AI_EXTRACTION_MODE,
+        "openai_available": OPENAI_AVAILABLE and bool(Config.OPENAI_API_KEY),
+        "aws_available": AWS_AVAILABLE and bool(Config.AWS_ACCESS_KEY)
+    }
 
-# Mount static files (make sure static directory exists)
+# Mount static files
 if os.path.exists("static"):
     app.mount("/", StaticFiles(directory="static", html=True), name="static")
 else:
     print("⚠️ Static directory not found. Create a 'static' folder with your HTML files.")
+    os.makedirs("static", exist_ok=True)
 
 # ==================== Main ====================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     print("=" * 60)
-    print("📄 Document Management System Starting...")
+    print("📄 AI-Powered Document Management System Starting...")
     print("=" * 60)
     print(f"🌐 Server will run on: http://0.0.0.0:{port}")
     print(f"📚 API Documentation: http://0.0.0.0:{port}/docs")
     print(f"🗄️  Database: {Config.DATABASE_TYPE.upper()}")
+    print(f"🤖 AI Mode: {Config.AI_EXTRACTION_MODE}")
     print("=" * 60)
     
     uvicorn.run(
