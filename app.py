@@ -47,15 +47,26 @@ class Config:
     ALGORITHM = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 30))
 
+    # PostgreSQL Configuration (default for production)
+    PG_HOST = os.getenv("PG_HOST", "localhost")
+    PG_PORT = os.getenv("PG_PORT", "5432")
+    PG_USER = os.getenv("PG_USER", "postgres")
+    PG_PASSWORD = os.getenv("PG_PASSWORD", "postgres")
+    PG_DB = os.getenv("PG_DB", "doc_management")
+
+    # MySQL fallback (optional)
     MYSQL_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
     MYSQL_PORT = os.getenv("MYSQL_PORT", "3306")
     MYSQL_USER = os.getenv("MYSQL_USER", "root")
     MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
     MYSQL_DB = os.getenv("MYSQL_DB", "doc_management")
 
-    USE_SQLITE_FALLBACK = os.getenv("USE_SQLITE_FALLBACK", "true").lower() == "true"  # Default to SQLite for easier deployment
-
-    DATABASE_URL = f"mysql+pymysql://{MYSQL_USER}:{MYSQL_PASSWORD}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB}"
+    # Database selection
+    DATABASE_TYPE = os.getenv("DATABASE_TYPE", "postgresql").lower()  # postgresql, mysql, sqlite
+    
+    # Render.com PostgreSQL URL (automatically provided)
+    RENDER_DATABASE_URL = os.getenv("DATABASE_URL")
+    
     SQLITE_URL = "sqlite:///./doc_management.db"
 
     UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
@@ -64,11 +75,25 @@ class Config:
 
     @classmethod
     def get_database_url(cls):
-        if cls.USE_SQLITE_FALLBACK:
-            print("⚠️ Using SQLite database")
+        # Priority 1: Use Render.com DATABASE_URL if available (PostgreSQL)
+        if cls.RENDER_DATABASE_URL:
+            print(f"✅ Using Render.com PostgreSQL database")
+            # Convert postgres:// to postgresql:// for SQLAlchemy
+            database_url = cls.RENDER_DATABASE_URL
+            if database_url.startswith("postgres://"):
+                database_url = database_url.replace("postgres://", "postgresql://", 1)
+            return database_url
+        
+        # Priority 2: Use specified DATABASE_TYPE
+        if cls.DATABASE_TYPE == "postgresql":
+            print(f"✅ Using PostgreSQL database at {cls.PG_HOST}:{cls.PG_PORT}")
+            return f"postgresql://{cls.PG_USER}:{cls.PG_PASSWORD}@{cls.PG_HOST}:{cls.PG_PORT}/{cls.PG_DB}"
+        elif cls.DATABASE_TYPE == "mysql":
+            print(f"✅ Using MySQL database at {cls.MYSQL_HOST}:{cls.MYSQL_PORT}")
+            return f"mysql+pymysql://{cls.MYSQL_USER}:{cls.MYSQL_PASSWORD}@{cls.MYSQL_HOST}:{cls.MYSQL_PORT}/{cls.MYSQL_DB}"
+        else:
+            print("⚠️ Using SQLite database (development only)")
             return cls.SQLITE_URL
-        print(f"✅ Using MySQL database at {cls.MYSQL_HOST}:{cls.MYSQL_PORT}")
-        return cls.DATABASE_URL
 
 # ==================== Database Setup ====================
 Base = declarative_base()
@@ -143,14 +168,23 @@ SessionLocal = None
 try:
     database_url = Config.get_database_url()
     
-    # Configure SQLite specifically if needed
-    if Config.USE_SQLITE_FALLBACK:
+    # Configure engine based on database type
+    if "sqlite" in database_url:
         engine = create_engine(
             database_url, 
             connect_args={"check_same_thread": False}
         )
-    else:
-        # MySQL connection
+    elif "postgresql" in database_url:
+        # PostgreSQL specific configuration
+        engine = create_engine(
+            database_url,
+            pool_pre_ping=True,
+            pool_size=10,
+            max_overflow=20,
+            pool_recycle=3600,
+            echo=False
+        )
+    else:  # MySQL
         engine = create_engine(
             database_url, 
             pool_pre_ping=True,
@@ -163,7 +197,7 @@ try:
 except Exception as e:
     print(f"❌ Database connection error: {e}")
     print("⚠️ Falling back to SQLite...")
-    Config.USE_SQLITE_FALLBACK = True
+    Config.DATABASE_TYPE = "sqlite"
     engine = create_engine(
         Config.SQLITE_URL, 
         connect_args={"check_same_thread": False}
@@ -392,11 +426,12 @@ class DuplicateDetector:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("🚀 Starting Document Management System...")
+    print(f"📊 Database Type: {Config.DATABASE_TYPE}")
     
     # Create tables
     if engine:
         Base.metadata.create_all(bind=engine)
-        print("✅ Database tables created")
+        print("✅ Database tables created/verified")
     
     # Create upload directory
     os.makedirs(Config.UPLOAD_DIR, exist_ok=True)
@@ -431,7 +466,8 @@ async def lifespan(app: FastAPI):
         db.close()
     
     print("=" * 60)
-    print("Document Management System Ready!")
+    print("📄 Document Management System Ready!")
+    print("=" * 60)
     print("Default Login Credentials:")
     print("  👑 Admin:    admin / Admin@123")
     print("  ✅ Approver: approver / Approver@123")
@@ -465,7 +501,7 @@ async def root():
 
 # ==================== Authentication Routes ====================
 @app.post("/api/auth/login", response_model=Token)
-async def login(response: Response, user_login: UserLogin, db: Session = Depends(get_db)):
+async def login(response: Response, user_login: UserLogin, request: Request, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == user_login.username).first()
     if not user or not verify_password(user_login.password, user.hashed_password):
         raise HTTPException(401, "Invalid username or password")
@@ -1351,6 +1387,7 @@ if __name__ == "__main__":
     print("=" * 60)
     print(f"🌐 Server will run on: http://0.0.0.0:{port}")
     print(f"📚 API Documentation: http://0.0.0.0:{port}/docs")
+    print(f"🗄️  Database: {Config.DATABASE_TYPE.upper()}")
     print("=" * 60)
     
     uvicorn.run(
