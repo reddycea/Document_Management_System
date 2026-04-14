@@ -5,26 +5,25 @@ import uuid
 import hashlib
 import json
 import base64
-import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 from enum import Enum
 from contextlib import asynccontextmanager
 
 # FastAPI and dependencies
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Query, status, Response, Request, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Query, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, RedirectResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Enum as SQLEnum, ForeignKey, Boolean, Text, and_, func, or_
+from pydantic import BaseModel, EmailStr
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Enum as SQLEnum, ForeignKey, Boolean, Text, and_, func
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 
 # Document processing
 import pytesseract
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageEnhance
 import pdf2image
 
 # Data processing and reporting
@@ -106,23 +105,23 @@ class Document(Base):
     id = Column(Integer, primary_key=True, index=True)
     filename = Column(String(255), nullable=False)
     file_path = Column(String(500), nullable=False)
-    file_hash = Column(String(64), unique=True)
+    file_hash = Column(String(64), unique=True, nullable=True)
     document_type = Column(String(20), nullable=False)
-    vendor_name = Column(String(200))
-    invoice_number = Column(String(100), index=True)
-    invoice_date = Column(DateTime)
-    amount = Column(Float)
-    vat_amount = Column(Float)
-    tax_rate = Column(Float)
+    vendor_name = Column(String(200), nullable=True)
+    invoice_number = Column(String(100), index=True, nullable=True)
+    invoice_date = Column(DateTime, nullable=True)
+    amount = Column(Float, nullable=True)
+    vat_amount = Column(Float, nullable=True)
+    tax_rate = Column(Float, nullable=True)
     upload_date = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    uploaded_by = Column(Integer, ForeignKey("users.id"))
+    uploaded_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     status = Column(SQLEnum(ApprovalStatus), default=ApprovalStatus.PENDING_LEVEL1)
     is_duplicate = Column(Boolean, default=False)
-    duplicate_reason = Column(Text)
+    duplicate_reason = Column(Text, nullable=True)
     extraction_method = Column(String(50), default="regex")
     extraction_confidence = Column(Float, default=0.0)
-    raw_extracted_text = Column(Text)
-    openai_response = Column(Text)
+    raw_extracted_text = Column(Text, nullable=True)
+    openai_response = Column(Text, nullable=True)
     rejection_reason = Column(Text, nullable=True)
     uploader = relationship("User")
 
@@ -133,7 +132,7 @@ class Approval(Base):
     approver_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     approval_level = Column(Integer)
     decision = Column(String(20))
-    comments = Column(Text)
+    comments = Column(Text, nullable=True)
     approved_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     document = relationship("Document")
     approver = relationship("User")
@@ -141,18 +140,18 @@ class Approval(Base):
 class AuditLog(Base):
     __tablename__ = "audit_logs"
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     action = Column(String(100))
-    details = Column(Text)
-    ip_address = Column(String(45))
+    details = Column(Text, nullable=True)
+    ip_address = Column(String(45), nullable=True)
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
-# Create engine
+# Create engine with proper settings
 engine = create_engine(
     Config.DATABASE_URL,
     pool_pre_ping=True,
-    pool_size=20,
-    max_overflow=40,
+    pool_size=10,
+    max_overflow=20,
     pool_recycle=3600,
     echo=False
 )
@@ -248,14 +247,6 @@ def validate_file(file_content: bytes, filename: str) -> None:
     ext = os.path.splitext(filename)[1].lower()
     if ext not in Config.ALLOWED_EXTENSIONS:
         raise HTTPException(400, f"Allowed extensions: {Config.ALLOWED_EXTENSIONS}")
-    magic_map = {b'%PDF': '.pdf', b'\xff\xd8': '.jpg', b'\x89PNG': '.png'}
-    detected = None
-    for magic, ext2 in magic_map.items():
-        if file_content.startswith(magic):
-            detected = ext2
-            break
-    if detected and detected != ext:
-        raise HTTPException(400, "File extension mismatch")
 
 def generate_secure_filename(original: str) -> str:
     ext = os.path.splitext(original)[1].lower()
@@ -269,9 +260,6 @@ class ImagePreprocessor:
             image = image.convert('L')
         enhancer = ImageEnhance.Contrast(image)
         image = enhancer.enhance(2.0)
-        enhancer = ImageEnhance.Sharpness(image)
-        image = enhancer.enhance(1.5)
-        image = image.point(lambda x: 0 if x < 128 else 255, '1')
         return image
     
     @staticmethod
@@ -301,14 +289,6 @@ Return ONLY a valid JSON object with these exact fields (use null if not found):
     "confidence": 0.95
 }
 
-Important rules:
-- Extract vendor name from "Bill From", "Seller", "Vendor", or company header
-- Extract invoice number from "Invoice #", "Invoice Number", "Reference"
-- Date format: Convert to YYYY-MM-DD
-- Amount: Remove currency symbols and commas, convert to number
-- VAT amount: Look for "VAT", "Tax", "GST", "HST"
-- Set confidence between 0 and 1 based on certainty
-
 DO NOT include any explanation. ONLY return the JSON object."""
             
             response = openai.ChatCompletion.create(
@@ -322,7 +302,6 @@ DO NOT include any explanation. ONLY return the JSON object."""
                                 "type": "image_url",
                                 "image_url": {
                                     "url": f"data:image/jpeg;base64,{base64_image}",
-                                    "detail": "high"
                                 }
                             }
                         ]
@@ -333,7 +312,6 @@ DO NOT include any explanation. ONLY return the JSON object."""
             )
             
             result_text = response.choices[0].message.content
-            # Clean up response if it contains markdown
             if result_text.startswith("```json"):
                 result_text = result_text.replace("```json", "").replace("```", "")
             result = json.loads(result_text)
@@ -353,11 +331,10 @@ DO NOT include any explanation. ONLY return the JSON object."""
             
             result["method"] = "openai"
             result["openai_raw_response"] = result_text
-            print(f"✅ OpenAI extraction successful with confidence: {result.get('confidence', 0)}")
             return result
             
         except Exception as e:
-            print(f"❌ OpenAI extraction error: {e}")
+            print(f"OpenAI extraction error: {e}")
             return None
 
 # ==================== Regex Extractor ====================
@@ -374,25 +351,22 @@ class RegexExtractor:
         
         patterns = {
             "vendor_name": [
-                r"(?:Vendor|Supplier|Company|Bill From|Seller|Issuer)[\s:]+([A-Za-z0-9\s&.,]+)(?:\n|$)",
-                r"^(?:From|Seller|Vendor):\s*([A-Za-z0-9\s&.,]+)(?:\n|$)"
+                r"(?:Vendor|Supplier|Company|Bill From|Seller)[\s:]+([A-Za-z0-9\s&.,]+)(?:\n|$)",
             ],
             "invoice_number": [
                 r"(?:Invoice|Document|Bill)[\s#:]+(\S+)",
                 r"(?:INV|INVOICE)[\s-]*(\d+)",
-                r"Invoice Number:\s*(\S+)"
             ],
             "invoice_date": [
                 r"(?:Date|Invoice Date|Issue Date)[\s:]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-                r"(\d{4}-\d{2}-\d{2})"
+                r"(\d{4}-\d{2}-\d{2})",
             ],
             "amount": [
-                r"(?:Total|Amount Due|Grand Total|Balance Due)[\s:]*[$]?([\d,]+\.?\d*)",
-                r"TOTAL\s+[$]?([\d,]+\.?\d*)"
+                r"(?:Total|Amount Due|Grand Total)[\s:]*[$]?([\d,]+\.?\d*)",
+                r"TOTAL\s+[$]?([\d,]+\.?\d*)",
             ],
             "vat_amount": [
                 r"(?:VAT|Tax|GST|HST)[\s:]*[$]?([\d,]+\.?\d*)",
-                r"Tax Amount\s+[$]?([\d,]+\.?\d*)"
             ]
         }
         
@@ -402,7 +376,7 @@ class RegexExtractor:
                 if m:
                     val = m.group(1).strip()
                     if key == "invoice_date":
-                        for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d", "%m-%d-%Y"):
+                        for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d"):
                             try:
                                 data[key] = datetime.strptime(val, fmt)
                                 break
@@ -418,13 +392,12 @@ class RegexExtractor:
                         data[key] = val
                     break
         
+        # Calculate confidence
         confidence = 0.0
         if data["vendor_name"]: confidence += 0.2
         if data["invoice_number"]: confidence += 0.25
         if data["invoice_date"]: confidence += 0.2
         if data["amount"]: confidence += 0.35
-        if data["amount"] and data["vat_amount"]: confidence += 0.1
-        
         data["confidence"] = min(confidence, 1.0)
         data["method"] = "regex"
         return data
@@ -433,13 +406,28 @@ class RegexExtractor:
 class DocumentExtractor:
     @staticmethod
     async def extract(file_path: str, document_type: str) -> Dict[str, Any]:
-        image_path = await DocumentExtractor.convert_to_image(file_path)
+        # Try to convert to image for OpenAI
+        image_path = None
+        ext = os.path.splitext(file_path)[1].lower()
         
+        if ext == '.pdf':
+            try:
+                images = pdf2image.convert_from_path(file_path, first_page=1, last_page=1)
+                if images:
+                    image_path = file_path.replace('.pdf', '.jpg')
+                    images[0].save(image_path, 'JPEG', quality=95)
+            except:
+                pass
+        else:
+            image_path = file_path
+        
+        # Try OpenAI first
         if Config.USE_OPENAI and Config.OPENAI_API_KEY and image_path:
             openai_result = await OpenAIExtractor.extract_with_openai(image_path)
             if openai_result and openai_result.get("confidence", 0) >= Config.CONFIDENCE_THRESHOLD:
                 return openai_result
         
+        # Fallback to OCR + regex
         text = await DocumentExtractor.extract_text(file_path)
         return await RegexExtractor.extract_from_text(text)
     
@@ -466,23 +454,6 @@ class DocumentExtractor:
             except Exception as e:
                 print(f"Image text extraction error: {e}")
                 return ""
-    
-    @staticmethod
-    async def convert_to_image(file_path: str) -> Optional[str]:
-        ext = os.path.splitext(file_path)[1].lower()
-        
-        if ext == '.pdf':
-            try:
-                images = pdf2image.convert_from_path(file_path, first_page=1, last_page=1)
-                if images:
-                    image_path = file_path.replace('.pdf', '.jpg')
-                    images[0].save(image_path, 'JPEG', quality=95)
-                    return image_path
-            except Exception as e:
-                print(f"PDF to image conversion error: {e}")
-                return None
-        else:
-            return file_path
 
 # ==================== Duplicate Detection ====================
 class DuplicateDetector:
@@ -501,7 +472,7 @@ class DuplicateDetector:
             if existing:
                 if document_type == "credit_note" and existing.document_type == "invoice":
                     return False, None
-                return True, f"Duplicate invoice number: {invoice_number} (Document #{existing.id})"
+                return True, f"Duplicate invoice number: {invoice_number}"
 
         # Check 3: Vendor + Amount validation (last 30 days)
         if document_type == "invoice" and vendor_name and amount:
@@ -515,9 +486,69 @@ class DuplicateDetector:
                 )
             ).first()
             if dup:
-                return True, f"Possible duplicate: same vendor and amount found in document #{dup.id}"
+                return True, f"Possible duplicate: same vendor and amount found"
 
         return False, None
+
+# ==================== Database Migration Helper ====================
+def init_database():
+    """Initialize database with proper column handling"""
+    try:
+        # Check if tables exist
+        inspector = None
+        try:
+            from sqlalchemy import inspect
+            inspector = inspect(engine)
+        except:
+            pass
+        
+        # Create all tables if they don't exist
+        Base.metadata.create_all(bind=engine)
+        print("✅ Database tables created/verified")
+        
+        # Add missing columns if needed (for existing databases)
+        with engine.connect() as conn:
+            # Check and add extraction_method column
+            try:
+                conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS extraction_method VARCHAR(50) DEFAULT 'regex'"))
+                conn.commit()
+            except:
+                pass
+            
+            # Check and add extraction_confidence column
+            try:
+                conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS extraction_confidence FLOAT DEFAULT 0.0"))
+                conn.commit()
+            except:
+                pass
+            
+            # Check and add raw_extracted_text column
+            try:
+                conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS raw_extracted_text TEXT"))
+                conn.commit()
+            except:
+                pass
+            
+            # Check and add openai_response column
+            try:
+                conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS openai_response TEXT"))
+                conn.commit()
+            except:
+                pass
+            
+            # Check and add rejection_reason column
+            try:
+                conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS rejection_reason TEXT"))
+                conn.commit()
+            except:
+                pass
+            
+            print("✅ Database columns verified")
+            
+    except Exception as e:
+        print(f"⚠️ Database initialization warning: {e}")
+
+from sqlalchemy import text
 
 # ==================== Lifespan ====================
 @asynccontextmanager
