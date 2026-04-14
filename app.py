@@ -16,7 +16,6 @@ from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Que
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, RedirectResponse, HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Enum as SQLEnum, ForeignKey, Boolean, Text, and_, func, or_
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
@@ -45,33 +44,35 @@ import uvicorn
 
 load_dotenv()
 
+# ==================== Configuration ====================
 class Config:
-    SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
-    if not SECRET_KEY or SECRET_KEY == "your-secret-key-change-this-in-production":
-        print("⚠️ WARNING: Using default SECRET_KEY. Set a secure key in .env file!")
-
+    SECRET_KEY = os.getenv("SECRET_KEY", "your-super-secret-key-change-in-production-2024")
     ALGORITHM = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 30))
-
-    # Database Configuration
-    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./doc_management.db")
+    ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 480))
+    
+    # PostgreSQL Database Configuration
+    PG_HOST = os.getenv("PG_HOST", "localhost")
+    PG_PORT = os.getenv("PG_PORT", "5432")
+    PG_USER = os.getenv("PG_USER", "postgres")
+    PG_PASSWORD = os.getenv("PG_PASSWORD", "postgres")
+    PG_DB = os.getenv("PG_DB", "doc_management")
+    
+    DATABASE_URL = f"postgresql://{PG_USER}:{PG_PASSWORD}@{PG_HOST}:{PG_PORT}/{PG_DB}"
     
     UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
     MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 10 * 1024 * 1024))
     ALLOWED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
-
+    
     # OpenAI Configuration
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
     OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     USE_OPENAI = os.getenv("USE_OPENAI", "true").lower() == "true"
-    CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", 0.7))
+    CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", 0.5))
 
 # Initialize OpenAI
 if Config.OPENAI_API_KEY:
     openai.api_key = Config.OPENAI_API_KEY
     print("✅ OpenAI API configured")
-else:
-    print("⚠️ OpenAI API key not set. Will use regex extraction only.")
 
 # ==================== Database Setup ====================
 Base = declarative_base()
@@ -134,6 +135,7 @@ class Approval(Base):
     decision = Column(String(20))
     comments = Column(Text)
     approved_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    document = relationship("Document")
     approver = relationship("User")
 
 class AuditLog(Base):
@@ -146,7 +148,14 @@ class AuditLog(Base):
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 # Create engine
-engine = create_engine(Config.DATABASE_URL, connect_args={"check_same_thread": False} if "sqlite" in Config.DATABASE_URL else {})
+engine = create_engine(
+    Config.DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=20,
+    max_overflow=40,
+    pool_recycle=3600,
+    echo=False
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def get_db():
@@ -174,7 +183,7 @@ class Token(BaseModel):
 
 class ApprovalAction(BaseModel):
     document_id: int
-    decision: str  # approved or rejected
+    decision: str
     comments: Optional[str] = None
 
 class ReportFilter(BaseModel):
@@ -184,7 +193,6 @@ class ReportFilter(BaseModel):
     status: Optional[str] = None
     min_amount: Optional[float] = None
     max_amount: Optional[float] = None
-    document_type: Optional[str] = None
 
 # ==================== Authentication ====================
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -198,7 +206,7 @@ def get_password_hash(password):
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=Config.ACCESS_TOKEN_EXPIRE_MINUTES))
+    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=15))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, Config.SECRET_KEY, algorithm=Config.ALGORITHM)
 
@@ -294,14 +302,14 @@ Return ONLY a valid JSON object with these exact fields (use null if not found):
 }
 
 Important rules:
-- Extract the vendor name from "Bill From", "Seller", "Vendor", or company logo/header
+- Extract vendor name from "Bill From", "Seller", "Vendor", or company header
 - Extract invoice number from "Invoice #", "Invoice Number", "Reference"
-- Date format: Convert to YYYY-MM-DD (e.g., 2024-01-15)
-- Amount: Remove currency symbols ($, €, £) and commas, convert to number
-- VAT amount: Look for "VAT", "Tax", "GST", "HST" amounts
-- Set confidence between 0 and 1 based on how certain you are
+- Date format: Convert to YYYY-MM-DD
+- Amount: Remove currency symbols and commas, convert to number
+- VAT amount: Look for "VAT", "Tax", "GST", "HST"
+- Set confidence between 0 and 1 based on certainty
 
-DO NOT include any explanation or additional text. ONLY return the JSON object."""
+DO NOT include any explanation. ONLY return the JSON object."""
             
             response = openai.ChatCompletion.create(
                 model=Config.OPENAI_MODEL,
@@ -325,9 +333,9 @@ DO NOT include any explanation or additional text. ONLY return the JSON object."
             )
             
             result_text = response.choices[0].message.content
-            # Clean the response to ensure valid JSON
-            result_text = re.sub(r'```json\n?', '', result_text)
-            result_text = re.sub(r'```\n?', '', result_text)
+            # Clean up response if it contains markdown
+            if result_text.startswith("```json"):
+                result_text = result_text.replace("```json", "").replace("```", "")
             result = json.loads(result_text)
             
             if result.get("invoice_date") and result["invoice_date"] != "null":
@@ -345,7 +353,6 @@ DO NOT include any explanation or additional text. ONLY return the JSON object."
             
             result["method"] = "openai"
             result["openai_raw_response"] = result_text
-            
             print(f"✅ OpenAI extraction successful with confidence: {result.get('confidence', 0)}")
             return result
             
@@ -368,8 +375,7 @@ class RegexExtractor:
         patterns = {
             "vendor_name": [
                 r"(?:Vendor|Supplier|Company|Bill From|Seller|Issuer)[\s:]+([A-Za-z0-9\s&.,]+)(?:\n|$)",
-                r"^(?:From|Seller|Vendor):\s*([A-Za-z0-9\s&.,]+)(?:\n|$)",
-                r"^([A-Za-z0-9\s&.,]+)(?:\n|$)"
+                r"^(?:From|Seller|Vendor):\s*([A-Za-z0-9\s&.,]+)(?:\n|$)"
             ],
             "invoice_number": [
                 r"(?:Invoice|Document|Bill)[\s#:]+(\S+)",
@@ -378,18 +384,15 @@ class RegexExtractor:
             ],
             "invoice_date": [
                 r"(?:Date|Invoice Date|Issue Date)[\s:]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-                r"(\d{4}-\d{2}-\d{2})",
-                r"(?:Date|Issued):\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
+                r"(\d{4}-\d{2}-\d{2})"
             ],
             "amount": [
                 r"(?:Total|Amount Due|Grand Total|Balance Due)[\s:]*[$]?([\d,]+\.?\d*)",
-                r"TOTAL\s+[$]?([\d,]+\.?\d*)",
-                r"Amount\s+Due:\s*[$]?([\d,]+\.?\d*)"
+                r"TOTAL\s+[$]?([\d,]+\.?\d*)"
             ],
             "vat_amount": [
                 r"(?:VAT|Tax|GST|HST)[\s:]*[$]?([\d,]+\.?\d*)",
-                r"Tax Amount\s+[$]?([\d,]+\.?\d*)",
-                r"(?:VAT|GST)\s+(\d+(?:\.\d+)?%)"
+                r"Tax Amount\s+[$]?([\d,]+\.?\d*)"
             ]
         }
         
@@ -399,7 +402,7 @@ class RegexExtractor:
                 if m:
                     val = m.group(1).strip()
                     if key == "invoice_date":
-                        for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d", "%m-%d-%Y", "%d-%m-%Y"):
+                        for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d", "%m-%d-%Y"):
                             try:
                                 data[key] = datetime.strptime(val, fmt)
                                 break
@@ -415,41 +418,24 @@ class RegexExtractor:
                         data[key] = val
                     break
         
-        confidence = RegexExtractor.calculate_confidence(data)
-        data["confidence"] = confidence
-        data["method"] = "regex"
-        
-        return data
-    
-    @staticmethod
-    def calculate_confidence(data: Dict) -> float:
         confidence = 0.0
-        weights = {
-            "vendor_name": 0.2,
-            "invoice_number": 0.25,
-            "invoice_date": 0.2,
-            "amount": 0.35
-        }
+        if data["vendor_name"]: confidence += 0.2
+        if data["invoice_number"]: confidence += 0.25
+        if data["invoice_date"]: confidence += 0.2
+        if data["amount"]: confidence += 0.35
+        if data["amount"] and data["vat_amount"]: confidence += 0.1
         
-        for field, weight in weights.items():
-            if data.get(field):
-                confidence += weight
-        
-        if data.get("amount") and data.get("vat_amount"):
-            confidence += 0.1
-        
-        return min(confidence, 1.0)
+        data["confidence"] = min(confidence, 1.0)
+        data["method"] = "regex"
+        return data
 
 # ==================== Main Extractor ====================
 class DocumentExtractor:
     @staticmethod
     async def extract(file_path: str, document_type: str) -> Dict[str, Any]:
         image_path = await DocumentExtractor.convert_to_image(file_path)
-        if not image_path:
-            text = await DocumentExtractor.extract_text(file_path)
-            return await RegexExtractor.extract_from_text(text)
         
-        if Config.USE_OPENAI and Config.OPENAI_API_KEY:
+        if Config.USE_OPENAI and Config.OPENAI_API_KEY and image_path:
             openai_result = await OpenAIExtractor.extract_with_openai(image_path)
             if openai_result and openai_result.get("confidence", 0) >= Config.CONFIDENCE_THRESHOLD:
                 return openai_result
@@ -503,13 +489,13 @@ class DuplicateDetector:
     @staticmethod
     def check_duplicate(db: Session, invoice_number: Optional[str], vendor_name: Optional[str],
                         amount: Optional[float], file_content: bytes, document_type: str) -> Tuple[bool, Optional[str]]:
-        # Method 1: File hash check
+        # Check 1: File hash match
         file_hash = hashlib.sha256(file_content).hexdigest()
         existing_file = db.query(Document).filter(Document.file_hash == file_hash).first()
         if existing_file:
             return True, f"Duplicate file content detected (Document #{existing_file.id})"
 
-        # Method 2: Invoice number check
+        # Check 2: Invoice number match
         if invoice_number:
             existing = db.query(Document).filter(Document.invoice_number == invoice_number).first()
             if existing:
@@ -517,7 +503,7 @@ class DuplicateDetector:
                     return False, None
                 return True, f"Duplicate invoice number: {invoice_number} (Document #{existing.id})"
 
-        # Method 3: Vendor + amount secondary validation (within 30 days)
+        # Check 3: Vendor + Amount validation (last 30 days)
         if document_type == "invoice" and vendor_name and amount:
             thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
             dup = db.query(Document).filter(
