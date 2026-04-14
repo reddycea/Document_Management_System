@@ -1506,7 +1506,13 @@ async def health():
         "openai_enabled": Config.USE_OPENAI,
         "openai_model": Config.OPENAI_MODEL if Config.USE_OPENAI else None
     }
+# ==================== Static Files ====================
 
+if os.path.exists("static"):
+    app.mount("/", StaticFiles(directory="static", html=True), name="static")
+else:
+    print("⚠️ Static directory not found. Create a 'static' folder with your HTML files.")
+    
 # ==================== Main ====================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
