@@ -7,8 +7,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 from enum import Enum
 from contextlib import asynccontextmanager
-from collections import Counter
-import json
 
 # FastAPI and dependencies
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Query, status, Response, Request
@@ -343,7 +341,7 @@ class AIExtractor:
     }
     
     @staticmethod
-    async def extract_from_image(image_path: str) -> Tuple[Dict[str, Any], float]:
+    async def extract_from_image(image_path: str):
         try:
             image = Image.open(image_path)
             if image.mode != 'RGB':
@@ -372,7 +370,7 @@ class AIExtractor:
             return AIExtractor._get_empty_extraction(), 0.0
     
     @staticmethod
-    async def extract_from_pdf(pdf_path: str) -> Tuple[Dict[str, Any], float]:
+    async def extract_from_pdf(pdf_path: str):
         try:
             images = pdf2image.convert_from_path(pdf_path, first_page=1, last_page=5, dpi=300)
             all_text = ""
@@ -392,7 +390,7 @@ class AIExtractor:
             return AIExtractor._get_empty_extraction(), 0.0
     
     @staticmethod
-    def _parse_document_text(text: str) -> Dict[str, Any]:
+    def _parse_document_text(text: str):
         data = {
             "vendor_name": None,
             "invoice_number": None,
@@ -453,7 +451,7 @@ class AIExtractor:
         return data
     
     @staticmethod
-    def _parse_date(date_str: str) -> Optional[datetime]:
+    def _parse_date(date_str: str):
         date_formats = [
             "%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d", "%m-%d-%Y", "%d-%m-%Y",
             "%b %d, %Y", "%B %d, %Y", "%d %b %Y", "%d %B %Y",
@@ -476,10 +474,11 @@ class AIExtractor:
         if match:
             try:
                 month_str, day, year = match.groups()
-                month_num = {
+                month_map = {
                     'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
                     'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12
-                }[month_str.upper()[:3]]
+                }
+                month_num = month_map[month_str.upper()[:3]]
                 return datetime(int(year), month_num, int(day))
             except:
                 pass
@@ -487,7 +486,7 @@ class AIExtractor:
         return None
     
     @staticmethod
-    def _calculate_confidence(extracted: Dict[str, Any], text: str) -> float:
+    def _calculate_confidence(extracted, text):
         confidence = 0.0
         total_fields = 0
         
@@ -528,7 +527,7 @@ class AIExtractor:
         return min(100, confidence)
     
     @staticmethod
-    def _get_empty_extraction() -> Dict[str, Any]:
+    def _get_empty_extraction():
         return {
             "vendor_name": None,
             "invoice_number": None,
@@ -541,7 +540,7 @@ class AIExtractor:
         }
     
     @staticmethod
-    def _get_suggestions(extracted: Dict[str, Any], confidence: float) -> List[str]:
+    def _get_suggestions(extracted, confidence):
         suggestions = []
         
         if confidence < 50:
@@ -570,8 +569,7 @@ class AIExtractor:
 # ==================== Duplicate Detection ====================
 class DuplicateDetector:
     @staticmethod
-    def check_duplicate(db: Session, invoice_number: Optional[str], vendor_name: Optional[str],
-                        amount: Optional[float], file_content: bytes, document_type: str) -> Tuple[bool, Optional[str]]:
+    def check_duplicate(db, invoice_number, vendor_name, amount, file_content, document_type):
         file_hash = hashlib.sha256(file_content).hexdigest()
         existing_file = db.query(Document).filter(Document.file_hash == file_hash).first()
         if existing_file:
@@ -756,9 +754,12 @@ async def upload_document(
     
     extracted_text_preview = ""
     if ext == ".pdf":
-        images = pdf2image.convert_from_path(file_path, first_page=1, last_page=1)
-        if images:
-            extracted_text_preview = pytesseract.image_to_string(images[0])[:1000]
+        try:
+            images = pdf2image.convert_from_path(file_path, first_page=1, last_page=1)
+            if images:
+                extracted_text_preview = pytesseract.image_to_string(images[0])[:1000]
+        except:
+            pass
     
     is_dup, dup_reason = DuplicateDetector.check_duplicate(
         db, extracted.get("invoice_number"), extracted.get("vendor_name"),
@@ -1603,6 +1604,9 @@ if os.path.exists(static_dir):
     print(f"✅ Static files mounted from {static_dir}")
 else:
     print(f"⚠️ Static directory '{static_dir}' not found. Create this folder with your HTML files.")
+    # Create a simple static directory if it doesn't exist
+    os.makedirs(static_dir, exist_ok=True)
+    app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
 
 # ==================== Main ====================
 if __name__ == "__main__":
