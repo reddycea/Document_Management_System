@@ -4,12 +4,12 @@ import io
 import uuid
 import hashlib
 import json
+import base64
 import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 from enum import Enum
 from contextlib import asynccontextmanager
-from functools import wraps
 
 # FastAPI and dependencies
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Query, status, Response, Request, BackgroundTasks
@@ -36,52 +36,12 @@ from reportlab.lib.pagesizes import letter, landscape
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 
+# OpenAI
+import openai
+
 # Configuration
 from dotenv import load_dotenv
 import uvicorn
-
-# Optional AI/ML imports with fallback
-try:
-    import cv2
-    import numpy as np
-    CV2_AVAILABLE = True
-except ImportError:
-    CV2_AVAILABLE = False
-    print("⚠️ OpenCV not installed. Install with: pip install opencv-python-headless")
-
-try:
-    import openai
-    OPENAI_AVAILABLE = True
-except ImportError:
-    OPENAI_AVAILABLE = False
-    print("⚠️ OpenAI not installed. Install with: pip install openai")
-
-try:
-    import anthropic
-    ANTHROPIC_AVAILABLE = True
-except ImportError:
-    ANTHROPIC_AVAILABLE = False
-    print("⚠️ Anthropic not installed. Install with: pip install anthropic")
-
-try:
-    import boto3
-    from botocore.exceptions import ClientError
-    AWS_AVAILABLE = True
-except ImportError:
-    AWS_AVAILABLE = False
-    print("⚠️ Boto3 not installed. Install with: pip install boto3")
-
-try:
-    from tenacity import retry, stop_after_attempt, wait_exponential
-    TENACITY_AVAILABLE = True
-except ImportError:
-    TENACITY_AVAILABLE = False
-    print("⚠️ Tenacity not installed. Install with: pip install tenacity")
-    # Create dummy decorator if tenacity not available
-    def retry(*args, **kwargs):
-        def decorator(func):
-            return func
-        return decorator
 
 load_dotenv()
 
@@ -93,41 +53,31 @@ class Config:
     ALGORITHM = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 30))
 
-    # PostgreSQL Configuration
+    # Database Configuration
     PG_HOST = os.getenv("PG_HOST", "localhost")
     PG_PORT = os.getenv("PG_PORT", "5432")
     PG_USER = os.getenv("PG_USER", "postgres")
     PG_PASSWORD = os.getenv("PG_PASSWORD", "postgres")
     PG_DB = os.getenv("PG_DB", "doc_management")
 
-    # MySQL fallback
     MYSQL_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
     MYSQL_PORT = os.getenv("MYSQL_PORT", "3306")
     MYSQL_USER = os.getenv("MYSQL_USER", "root")
     MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
     MYSQL_DB = os.getenv("MYSQL_DB", "doc_management")
 
-    # Database selection
     DATABASE_TYPE = os.getenv("DATABASE_TYPE", "postgresql").lower()
-    
-    # Render.com PostgreSQL URL
     RENDER_DATABASE_URL = os.getenv("DATABASE_URL")
-    
     SQLITE_URL = "sqlite:///./doc_management.db"
 
     UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
     MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 10 * 1024 * 1024))
     ALLOWED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
 
-    # AI Configuration
-    AI_EXTRACTION_MODE = os.getenv("AI_EXTRACTION_MODE", "regex")  # regex, hybrid
+    # OpenAI Configuration
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-    AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY", "")
-    AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY", "")
-    AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-    
-    # Confidence threshold for hybrid mode
+    OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4-vision-preview")  # or gpt-4o, gpt-4-turbo
+    USE_OPENAI = os.getenv("USE_OPENAI", "true").lower() == "true"  # Set to false to use only regex
     CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", 0.7))
 
     @classmethod
@@ -148,6 +98,13 @@ class Config:
         else:
             print("⚠️ Using SQLite database (development only)")
             return cls.SQLITE_URL
+
+# Initialize OpenAI
+if Config.OPENAI_API_KEY:
+    openai.api_key = Config.OPENAI_API_KEY
+    print("✅ OpenAI API configured")
+else:
+    print("⚠️ OpenAI API key not set. Will use regex extraction only.")
 
 # ==================== Database Setup ====================
 Base = declarative_base()
@@ -197,6 +154,7 @@ class Document(Base):
     extraction_method = Column(String(50), default="regex")
     extraction_confidence = Column(Float, default=0.0)
     raw_extracted_text = Column(Text)
+    openai_response = Column(Text)  # Store raw OpenAI response for debugging
     uploader = relationship("User")
 
 class Approval(Base):
@@ -361,94 +319,118 @@ def generate_secure_filename(original: str) -> str:
 # ==================== Image Preprocessing ====================
 class ImagePreprocessor:
     @staticmethod
-    def preprocess_image(image_path: str) -> str:
-        """Apply basic image preprocessing to improve OCR accuracy"""
-        if not CV2_AVAILABLE:
-            return image_path
-        
-        try:
-            # Read image
-            image = cv2.imread(image_path)
-            if image is None:
-                return image_path
-            
-            # Convert to grayscale
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            
-            # Denoise
-            denoised = cv2.fastNlMeansDenoising(gray, h=30)
-            
-            # Increase contrast using CLAHE
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-            enhanced = clahe.apply(denoised)
-            
-            # Binarization with Otsu's method
-            _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            
-            # Save preprocessed image
-            preprocessed_path = image_path.replace('.', '_preprocessed.')
-            cv2.imwrite(preprocessed_path, binary)
-            
-            return preprocessed_path
-        except Exception as e:
-            print(f"Preprocessing error: {e}")
-            return image_path
-    
-    @staticmethod
     def preprocess_pil_image(image: Image.Image) -> Image.Image:
         """Preprocess PIL image for better OCR"""
-        # Convert to grayscale
         if image.mode != 'L':
             image = image.convert('L')
         
-        # Enhance contrast
         enhancer = ImageEnhance.Contrast(image)
         image = enhancer.enhance(2.0)
         
-        # Sharpen
         enhancer = ImageEnhance.Sharpness(image)
         image = enhancer.enhance(1.5)
         
-        # Apply threshold
         image = image.point(lambda x: 0 if x < 128 else 255, '1')
         
         return image
+    
+    @staticmethod
+    def image_to_base64(image_path: str) -> str:
+        """Convert image to base64 for OpenAI API"""
+        with open(image_path, "rb") as f:
+            return base64.b64encode(f.read()).decode()
 
-# ==================== AI Document Extractor ====================
-class AIExtractor:
+# ==================== OpenAI Extractor ====================
+class OpenAIExtractor:
     @staticmethod
-    async def extract_from_image(image_path: str) -> Dict[str, Any]:
+    async def extract_with_openai(image_path: str) -> Dict[str, Any]:
+        """Extract invoice data using GPT-4 Vision"""
+        if not Config.OPENAI_API_KEY or not Config.USE_OPENAI:
+            return None
+        
         try:
-            # Preprocess image
-            preprocessed_path = ImagePreprocessor.preprocess_image(image_path)
-            image = Image.open(preprocessed_path)
-            text = pytesseract.image_to_string(image)
+            # Convert image to base64
+            base64_image = ImagePreprocessor.image_to_base64(image_path)
             
-            # Clean up preprocessed file if different
-            if preprocessed_path != image_path and os.path.exists(preprocessed_path):
-                os.remove(preprocessed_path)
+            # Prepare the prompt
+            prompt = """You are an expert invoice extraction system. Extract the following information from this invoice document.
+
+Return ONLY a valid JSON object with these exact fields (use null if not found):
+{
+    "vendor_name": "The name of the vendor/company issuing the invoice",
+    "invoice_number": "The invoice number or reference number",
+    "invoice_date": "The invoice date in YYYY-MM-DD format",
+    "amount": "The total amount due as a number (without currency symbol)",
+    "vat_amount": "The VAT/tax amount as a number (without currency symbol)",
+    "confidence": 0.95
+}
+
+Important rules:
+- Extract the vendor name from "Bill From", "Seller", "Vendor", or company logo/header
+- Extract invoice number from "Invoice #", "Invoice Number", "Reference"
+- Date format: Convert to YYYY-MM-DD (e.g., 2024-01-15)
+- Amount: Remove currency symbols ($, €, £) and commas, convert to number
+- VAT amount: Look for "VAT", "Tax", "GST", "HST" amounts
+- Set confidence between 0 and 1 based on how certain you are
+
+DO NOT include any explanation or additional text. ONLY return the JSON object."""
             
-            return AIExtractor._parse_document_text(text)
+            # Call OpenAI API
+            response = openai.ChatCompletion.create(
+                model=Config.OPENAI_MODEL,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{base64_image}",
+                                    "detail": "high"
+                                }
+                            }
+                        ]
+                    }
+                ],
+                max_tokens=500,
+                temperature=0.1,
+                response_format={"type": "json_object"}
+            )
+            
+            # Parse response
+            result_text = response.choices[0].message.content
+            result = json.loads(result_text)
+            
+            # Convert date string to datetime if present
+            if result.get("invoice_date") and result["invoice_date"] != "null":
+                try:
+                    result["invoice_date"] = datetime.strptime(result["invoice_date"], "%Y-%m-%d")
+                except:
+                    result["invoice_date"] = None
+            
+            # Ensure numeric fields are floats
+            for field in ["amount", "vat_amount"]:
+                if result.get(field) and result[field] != "null":
+                    try:
+                        result[field] = float(result[field])
+                    except:
+                        result[field] = None
+            
+            result["method"] = "openai"
+            result["openai_raw_response"] = result_text
+            
+            print(f"✅ OpenAI extraction successful with confidence: {result.get('confidence', 0)}")
+            return result
+            
         except Exception as e:
-            print(f"OCR error: {e}")
-            return AIExtractor._get_empty_extraction()
-    
+            print(f"❌ OpenAI extraction error: {e}")
+            return None
+
+# ==================== Regex Extractor (Fallback) ====================
+class RegexExtractor:
     @staticmethod
-    async def extract_from_pdf(pdf_path: str) -> Dict[str, Any]:
-        try:
-            images = pdf2image.convert_from_path(pdf_path, first_page=1, last_page=3)
-            text = ""
-            for img in images:
-                # Preprocess each image
-                img = ImagePreprocessor.preprocess_pil_image(img)
-                text += pytesseract.image_to_string(img)
-            return AIExtractor._parse_document_text(text)
-        except Exception as e:
-            print(f"PDF extraction error: {e}")
-            return AIExtractor._get_empty_extraction()
-    
-    @staticmethod
-    def _parse_document_text(text: str) -> Dict[str, Any]:
+    async def extract_from_text(text: str) -> Dict[str, Any]:
         data = {
             "vendor_name": None,
             "invoice_number": None,
@@ -499,7 +481,6 @@ class AIExtractor:
                                 pass
                     elif key in ("amount", "vat_amount"):
                         try:
-                            # Remove currency symbols and commas
                             val = re.sub(r'[^\d.,-]', '', val)
                             data[key] = float(val.replace(",", ""))
                         except:
@@ -509,14 +490,14 @@ class AIExtractor:
                     break
         
         # Calculate confidence
-        confidence = AIExtractor._calculate_confidence(data)
+        confidence = RegexExtractor.calculate_confidence(data)
         data["confidence"] = confidence
         data["method"] = "regex"
         
         return data
     
     @staticmethod
-    def _calculate_confidence(data: Dict) -> float:
+    def calculate_confidence(data: Dict) -> float:
         confidence = 0.0
         weights = {
             "vendor_name": 0.2,
@@ -529,57 +510,87 @@ class AIExtractor:
             if data.get(field):
                 confidence += weight
         
-        # Bonus for having both amount and VAT
         if data.get("amount") and data.get("vat_amount"):
             confidence += 0.1
         
         return min(confidence, 1.0)
+
+# ==================== Main Extractor (Hybrid) ====================
+class DocumentExtractor:
+    @staticmethod
+    async def extract(file_path: str, document_type: str) -> Dict[str, Any]:
+        """Extract document data using OpenAI with regex fallback"""
+        
+        # Convert to image if PDF
+        image_path = await DocumentExtractor.convert_to_image(file_path)
+        if not image_path:
+            # Fallback to text extraction
+            text = await DocumentExtractor.extract_text(file_path)
+            return await RegexExtractor.extract_from_text(text)
+        
+        # Try OpenAI first
+        if Config.USE_OPENAI and Config.OPENAI_API_KEY:
+            openai_result = await OpenAIExtractor.extract_with_openai(image_path)
+            if openai_result and openai_result.get("confidence", 0) >= Config.CONFIDENCE_THRESHOLD:
+                return openai_result
+        
+        # Fallback to regex
+        text = await DocumentExtractor.extract_text(file_path)
+        return await RegexExtractor.extract_from_text(text)
     
     @staticmethod
-    def _get_empty_extraction():
-        return {
-            "vendor_name": None,
-            "invoice_number": None,
-            "invoice_date": None,
-            "amount": None,
-            "vat_amount": None,
-            "confidence": 0.0,
-            "method": "regex"
-        }
-
-# ==================== Hybrid Extractor ====================
-class HybridExtractor:
-    @staticmethod
-    async def smart_extract(file_path: str, document_type: str) -> Dict[str, Any]:
-        """Smart extraction with fallback strategies"""
+    async def extract_text(file_path: str) -> str:
+        """Extract text using OCR"""
         ext = os.path.splitext(file_path)[1].lower()
         
-        # Try standard extraction first
-        if ext == ".pdf":
-            result = await AIExtractor.extract_from_pdf(file_path)
+        if ext == '.pdf':
+            try:
+                images = pdf2image.convert_from_path(file_path, first_page=1, last_page=3)
+                text = ""
+                for img in images:
+                    img = ImagePreprocessor.preprocess_pil_image(img)
+                    text += pytesseract.image_to_string(img)
+                return text
+            except Exception as e:
+                print(f"PDF text extraction error: {e}")
+                return ""
         else:
-            result = await AIExtractor.extract_from_image(file_path)
+            try:
+                image = Image.open(file_path)
+                image = ImagePreprocessor.preprocess_pil_image(image)
+                return pytesseract.image_to_string(image)
+            except Exception as e:
+                print(f"Image text extraction error: {e}")
+                return ""
+    
+    @staticmethod
+    async def convert_to_image(file_path: str) -> Optional[str]:
+        """Convert document to image for OpenAI Vision"""
+        ext = os.path.splitext(file_path)[1].lower()
         
-        # If confidence is low and we have AWS available, try that
-        if result.get("confidence", 0) < Config.CONFIDENCE_THRESHOLD and Config.AI_EXTRACTION_MODE == "hybrid":
-            # In a real implementation, you would add AWS Textract or other services here
-            # For now, just return the regex result
-            pass
-        
-        return result
+        if ext == '.pdf':
+            try:
+                images = pdf2image.convert_from_path(file_path, first_page=1, last_page=1)
+                if images:
+                    image_path = file_path.replace('.pdf', '.jpg')
+                    images[0].save(image_path, 'JPEG', quality=95)
+                    return image_path
+            except Exception as e:
+                print(f"PDF to image conversion error: {e}")
+                return None
+        else:
+            return file_path
 
 # ==================== Duplicate Detection ====================
 class DuplicateDetector:
     @staticmethod
     def check_duplicate(db: Session, invoice_number: Optional[str], vendor_name: Optional[str],
                         amount: Optional[float], file_content: bytes, document_type: str) -> Tuple[bool, Optional[str]]:
-        # 1. File hash duplicate
         file_hash = hashlib.sha256(file_content).hexdigest()
         existing_file = db.query(Document).filter(Document.file_hash == file_hash).first()
         if existing_file:
             return True, f"Duplicate file content detected (Document #{existing_file.id})"
 
-        # 2. Invoice number match
         if invoice_number:
             existing = db.query(Document).filter(Document.invoice_number == invoice_number).first()
             if existing:
@@ -587,7 +598,6 @@ class DuplicateDetector:
                     return False, None
                 return True, f"Duplicate invoice number: {invoice_number} (Document #{existing.id})"
 
-        # 3. Vendor + amount secondary check
         if document_type == "invoice" and vendor_name and amount:
             thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
             dup = db.query(Document).filter(
@@ -603,35 +613,16 @@ class DuplicateDetector:
 
         return False, None
 
-# ==================== Background Tasks ====================
-async def process_document_background(document_id: int, file_path: str, document_type: str, db: Session):
-    """Background task for advanced document processing"""
-    try:
-        # Perform advanced extraction if needed
-        result = await HybridExtractor.smart_extract(file_path, document_type)
-        
-        # Update document with extraction results
-        doc = db.query(Document).filter(Document.id == document_id).first()
-        if doc:
-            doc.vendor_name = result.get("vendor_name")
-            doc.invoice_number = result.get("invoice_number")
-            doc.invoice_date = result.get("invoice_date")
-            doc.amount = result.get("amount")
-            doc.vat_amount = result.get("vat_amount")
-            doc.extraction_method = result.get("method", "regex")
-            doc.extraction_confidence = result.get("confidence", 0.0)
-            db.commit()
-            
-            print(f"✅ Background processing complete for document {document_id}")
-    except Exception as e:
-        print(f"❌ Background processing error for document {document_id}: {e}")
-
 # ==================== Lifespan ====================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("🚀 Starting Document Management System...")
     print(f"📊 Database Type: {Config.DATABASE_TYPE}")
-    print(f"🤖 AI Extraction Mode: {Config.AI_EXTRACTION_MODE}")
+    print(f"🤖 OpenAI Integration: {'Enabled' if Config.USE_OPENAI and Config.OPENAI_API_KEY else 'Disabled'}")
+    print(f"🎯 Confidence Threshold: {Config.CONFIDENCE_THRESHOLD}")
+    
+    if Config.USE_OPENAI and Config.OPENAI_API_KEY:
+        print(f"📡 OpenAI Model: {Config.OPENAI_MODEL}")
     
     # Create tables
     if engine:
@@ -686,8 +677,8 @@ async def lifespan(app: FastAPI):
 # ==================== FastAPI App ====================
 app = FastAPI(
     title="DocManager AI", 
-    version="4.0", 
-    description="AI-Powered Document Management System",
+    version="5.0", 
+    description="AI-Powered Document Management System with OpenAI Integration",
     lifespan=lifespan
 )
 
@@ -732,7 +723,6 @@ async def login(
         max_age=Config.ACCESS_TOKEN_EXPIRE_MINUTES * 60
     )
     
-    # Log audit
     audit = AuditLog(
         user_id=user.id, 
         action="LOGIN", 
@@ -763,7 +753,6 @@ async def get_current_user_info(current_user: User = Depends(get_current_user)):
 @app.post("/api/documents/upload")
 async def upload_document(
     request: Request,
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     document_type: str = Form(...),
     current_user: User = Depends(role_required([UserRole.ADMIN, UserRole.APPROVER, UserRole.MANAGER])),
@@ -781,13 +770,9 @@ async def upload_document(
         f.write(content)
     
     file_hash = hashlib.sha256(content).hexdigest()
-    ext = os.path.splitext(file.filename)[1].lower()
     
-    # Extract with hybrid approach
-    if ext == ".pdf":
-        extracted = await AIExtractor.extract_from_pdf(file_path)
-    else:
-        extracted = await AIExtractor.extract_from_image(file_path)
+    # Extract data using OpenAI (with regex fallback)
+    extracted = await DocumentExtractor.extract(file_path, document_type)
     
     # Check for duplicates
     is_dup, dup_reason = DuplicateDetector.check_duplicate(
@@ -809,8 +794,9 @@ async def upload_document(
         status=ApprovalStatus.PENDING_LEVEL1,
         is_duplicate=is_dup,
         duplicate_reason=dup_reason,
-        extraction_method=extracted.get("method", "regex"),
-        extraction_confidence=extracted.get("confidence", 0.0)
+        extraction_method=extracted.get("method", "unknown"),
+        extraction_confidence=extracted.get("confidence", 0.0),
+        openai_response=extracted.get("openai_raw_response")
     )
     db.add(doc)
     db.commit()
@@ -820,15 +806,11 @@ async def upload_document(
     audit = AuditLog(
         user_id=current_user.id, 
         action="UPLOAD", 
-        details=f"Uploaded {file.filename} (ID: {doc.id})", 
+        details=f"Uploaded {file.filename} (ID: {doc.id}) using {doc.extraction_method}", 
         ip_address=request.client.host if hasattr(request, 'client') else "unknown"
     )
     db.add(audit)
     db.commit()
-    
-    # Trigger background processing if confidence is low
-    if extracted.get("confidence", 0) < Config.CONFIDENCE_THRESHOLD:
-        background_tasks.add_task(process_document_background, doc.id, file_path, document_type, db)
     
     return {
         "message": "Document uploaded",
@@ -840,6 +822,7 @@ async def upload_document(
             "amount": extracted.get("amount"),
             "vat_amount": extracted.get("vat_amount")
         },
+        "extraction_method": extracted.get("method"),
         "extraction_confidence": extracted.get("confidence", 0),
         "is_duplicate": is_dup,
         "duplicate_reason": dup_reason,
@@ -873,6 +856,7 @@ async def list_documents(
             "status": d.status.value,
             "upload_date": d.upload_date,
             "is_duplicate": d.is_duplicate,
+            "extraction_method": d.extraction_method,
             "extraction_confidence": d.extraction_confidence
         }
         for d in docs
@@ -907,6 +891,7 @@ async def get_document(
             "upload_date": doc.upload_date,
             "is_duplicate": doc.is_duplicate,
             "duplicate_reason": doc.duplicate_reason,
+            "extraction_method": doc.extraction_method,
             "extraction_confidence": doc.extraction_confidence
         },
         "approval_history": [
@@ -973,7 +958,6 @@ async def process_approval(
     
     db.commit()
     
-    # Log audit
     audit = AuditLog(
         user_id=current_user.id, 
         action="APPROVAL", 
@@ -1017,7 +1001,7 @@ async def get_pending_approvals(
         for d in docs
     ]
 
-# ==================== Report Routes ====================
+# ==================== Report Routes (simplified - same as before) ====================
 @app.post("/api/reports/spend-summary")
 async def spend_summary(
     filters: ReportFilter,
@@ -1137,7 +1121,7 @@ async def tax_report(
         ]
     }
 
-# ==================== Export Routes ====================
+# ==================== Export Routes (simplified) ====================
 @app.get("/api/reports/export/excel")
 async def export_excel(
     start_date: Optional[datetime] = Query(None),
@@ -1181,6 +1165,7 @@ async def export_excel(
             "VAT Amount": d.vat_amount or 0,
             "Status": d.status.value,
             "Upload Date": d.upload_date,
+            "Extraction Method": d.extraction_method,
             "Extraction Confidence": f"{d.extraction_confidence*100:.1f}%" if d.extraction_confidence else "N/A"
         })
     
@@ -1351,6 +1336,11 @@ async def get_ai_insights(
     if total_vat > 0:
         insights.append(f"🧾 Total VAT collected: ${total_vat:,.2f}")
     
+    # Add extraction quality insight
+    openai_docs = [d for d in docs if d.extraction_method == "openai"]
+    if openai_docs:
+        insights.append(f"🤖 OpenAI extracted {len(openai_docs)} documents with avg confidence {np.mean([d.extraction_confidence for d in openai_docs]):.1%}")
+    
     return {
         "insights": insights,
         "anomalies": anomalies[:10],
@@ -1486,7 +1476,6 @@ async def get_extraction_stats(
     current_user: User = Depends(role_required([UserRole.ADMIN])),
     db: Session = Depends(get_db)
 ):
-    """Get statistics about extraction methods and confidence"""
     stats = db.query(
         Document.extraction_method,
         func.count(Document.id).label('count'),
@@ -1503,7 +1492,9 @@ async def get_extraction_stats(
             for stat in stats
         ],
         "total_documents": db.query(Document).count(),
-        "low_confidence_documents": db.query(Document).filter(Document.extraction_confidence < Config.CONFIDENCE_THRESHOLD).count()
+        "low_confidence_documents": db.query(Document).filter(Document.extraction_confidence < Config.CONFIDENCE_THRESHOLD).count(),
+        "openai_enabled": Config.USE_OPENAI and bool(Config.OPENAI_API_KEY),
+        "openai_model": Config.OPENAI_MODEL if Config.USE_OPENAI else None
     }
 
 @app.get("/health")
@@ -1511,22 +1502,23 @@ async def health():
     return {
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc),
-        "ai_mode": Config.AI_EXTRACTION_MODE,
-        "cv2_available": CV2_AVAILABLE,
-        "openai_available": OPENAI_AVAILABLE,
-        "aws_available": AWS_AVAILABLE
+        "openai_configured": bool(Config.OPENAI_API_KEY),
+        "openai_enabled": Config.USE_OPENAI,
+        "openai_model": Config.OPENAI_MODEL if Config.USE_OPENAI else None
     }
 
 # ==================== Main ====================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     print("=" * 60)
-    print("📄 AI-Powered Document Management System Starting...")
+    print("📄 OpenAI-Powered Document Management System Starting...")
     print("=" * 60)
     print(f"🌐 Server will run on: http://0.0.0.0:{port}")
     print(f"📚 API Documentation: http://0.0.0.0:{port}/docs")
     print(f"🗄️  Database: {Config.DATABASE_TYPE.upper()}")
-    print(f"🤖 AI Mode: {Config.AI_EXTRACTION_MODE}")
+    print(f"🤖 OpenAI: {'Enabled' if Config.USE_OPENAI and Config.OPENAI_API_KEY else 'Disabled'}")
+    if Config.USE_OPENAI and Config.OPENAI_API_KEY:
+        print(f"📡 Model: {Config.OPENAI_MODEL}")
     print("=" * 60)
     
     uvicorn.run(
