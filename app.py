@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 # FastAPI and dependencies
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Query, status, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, RedirectResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field
@@ -29,8 +29,8 @@ import pdf2image
 import pandas as pd
 import numpy as np
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import letter, landscape
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
 from reportlab.lib.styles import getSampleStyleSheet
 
 # Configuration
@@ -62,9 +62,9 @@ class Config:
     MYSQL_DB = os.getenv("MYSQL_DB", "doc_management")
 
     # Database selection
-    DATABASE_TYPE = os.getenv("DATABASE_TYPE", "postgresql").lower()
+    DATABASE_TYPE = os.getenv("DATABASE_TYPE", "postgresql").lower()  # postgresql, mysql, sqlite
     
-    # Render.com PostgreSQL URL
+    # Render.com PostgreSQL URL (automatically provided)
     RENDER_DATABASE_URL = os.getenv("DATABASE_URL")
     
     SQLITE_URL = "sqlite:///./doc_management.db"
@@ -72,22 +72,19 @@ class Config:
     UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
     MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 10 * 1024 * 1024))
     ALLOWED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
-    
-    # OpenAI Configuration
-    USE_OPENAI = os.getenv("USE_OPENAI", "false").lower() == "true"
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-    OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
-    CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", 0.7))
 
     @classmethod
     def get_database_url(cls):
+        # Priority 1: Use Render.com DATABASE_URL if available (PostgreSQL)
         if cls.RENDER_DATABASE_URL:
             print(f"✅ Using Render.com PostgreSQL database")
+            # Convert postgres:// to postgresql:// for SQLAlchemy
             database_url = cls.RENDER_DATABASE_URL
             if database_url.startswith("postgres://"):
                 database_url = database_url.replace("postgres://", "postgresql://", 1)
             return database_url
         
+        # Priority 2: Use specified DATABASE_TYPE
         if cls.DATABASE_TYPE == "postgresql":
             print(f"✅ Using PostgreSQL database at {cls.PG_HOST}:{cls.PG_PORT}")
             return f"postgresql://{cls.PG_USER}:{cls.PG_PASSWORD}@{cls.PG_HOST}:{cls.PG_PORT}/{cls.PG_DB}"
@@ -143,10 +140,6 @@ class Document(Base):
     status = Column(SQLEnum(ApprovalStatus), default=ApprovalStatus.PENDING_LEVEL1)
     is_duplicate = Column(Boolean, default=False)
     duplicate_reason = Column(Text)
-    rejection_reason = Column(Text, nullable=True)  # Added this field
-    extraction_method = Column(String(50), default="ocr")
-    extraction_confidence = Column(Float, default=0.0)
-    openai_response = Column(Text, nullable=True)
     uploader = relationship("User")
 
 class Approval(Base):
@@ -158,7 +151,6 @@ class Approval(Base):
     decision = Column(String(20))
     comments = Column(Text)
     approved_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    approver = relationship("User")
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
@@ -177,6 +169,7 @@ try:
     database_url = Config.get_database_url()
 
     if "postgresql" in database_url:
+        # PostgreSQL specific configuration
         engine = create_engine(
             database_url,
             pool_pre_ping=True,
@@ -185,7 +178,7 @@ try:
             pool_recycle=3600,
             echo=False
         )
-    else:
+    else:  # MySQL
         engine = create_engine(
             database_url, 
             pool_pre_ping=True,
@@ -241,7 +234,6 @@ class ReportFilter(BaseModel):
     status: Optional[str] = None
     min_amount: Optional[float] = None
     max_amount: Optional[float] = None
-    document_type: Optional[str] = None
 
 # ==================== Authentication ====================
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -310,109 +302,6 @@ def generate_secure_filename(original: str) -> str:
     ext = os.path.splitext(original)[1].lower()
     return f"{uuid.uuid4().hex}{ext}"
 
-def add_missing_columns():
-    """Add missing columns to the database"""
-    database_url = Config.get_database_url()
-    
-    # Handle PostgreSQL vs SQLite
-    if "postgresql" in database_url:
-        engine = create_engine(database_url)
-        with engine.connect() as conn:
-            # Check if column exists
-            result = conn.execute(text("""
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name='documents' AND column_name='rejection_reason'
-            """))
-            
-            if result.rowcount == 0:
-                print("Adding rejection_reason column to documents table...")
-                conn.execute(text(
-                    "ALTER TABLE documents ADD COLUMN rejection_reason TEXT"
-                ))
-                conn.commit()
-                print("✅ Column added successfully")
-            else:
-                print("✅ rejection_reason column already exists")
-                
-    elif "sqlite" in database_url:
-        # SQLite doesn't support ALTER TABLE ADD COLUMN as easily
-        # Need to recreate the table
-        engine = create_engine(database_url)
-        with engine.connect() as conn:
-            # Check if column exists
-            result = conn.execute(text(
-                "PRAGMA table_info(documents)"
-            ))
-            columns = [row[1] for row in result]
-            
-            if 'rejection_reason' not in columns:
-                print("Recreating documents table with rejection_reason column...")
-                
-                # SQLite migration approach
-                conn.execute(text("""
-                    CREATE TABLE documents_new (
-                        id INTEGER PRIMARY KEY,
-                        filename VARCHAR(255) NOT NULL,
-                        file_path VARCHAR(500) NOT NULL,
-                        file_hash VARCHAR(64) UNIQUE,
-                        document_type VARCHAR(20) NOT NULL,
-                        vendor_name VARCHAR(200),
-                        invoice_number VARCHAR(100),
-                        invoice_date DATETIME,
-                        amount FLOAT,
-                        vat_amount FLOAT,
-                        tax_rate FLOAT,
-                        upload_date DATETIME,
-                        uploaded_by INTEGER,
-                        status VARCHAR(20),
-                        is_duplicate BOOLEAN,
-                        duplicate_reason TEXT,
-                        rejection_reason TEXT,
-                        extraction_method VARCHAR(50),
-                        extraction_confidence FLOAT,
-                        openai_response TEXT,
-                        FOREIGN KEY(uploaded_by) REFERENCES users(id)
-                    )
-                """))
-                
-                # Copy data from old table
-                conn.execute(text("""
-                    INSERT INTO documents_new 
-                    SELECT id, filename, file_path, file_hash, document_type, 
-                           vendor_name, invoice_number, invoice_date, amount, 
-                           vat_amount, tax_rate, upload_date, uploaded_by, 
-                           status, is_duplicate, duplicate_reason, 
-                           NULL as rejection_reason,
-                           extraction_method, extraction_confidence, openai_response
-                    FROM documents
-                """))
-                
-                # Drop old table and rename new one
-                conn.execute(text("DROP TABLE documents"))
-                conn.execute(text("ALTER TABLE documents_new RENAME TO documents"))
-                conn.commit()
-                print("✅ Table recreated with rejection_reason column")
-            else:
-                print("✅ rejection_reason column already exists")
-    
-    else:
-        print(f"Unsupported database type: {Config.DATABASE_TYPE}")
-
-# ==================== Document Extractor ====================
-class DocumentExtractor:
-    @staticmethod
-    async def extract(file_path: str, document_type: str) -> Dict[str, Any]:
-        """Extract data from document based on file type"""
-        ext = os.path.splitext(file_path)[1].lower()
-        
-        if ext == '.pdf':
-            return await AIExtractor.extract_from_pdf(file_path)
-        elif ext in ['.jpg', '.jpeg', '.png']:
-            return await AIExtractor.extract_from_image(file_path)
-        else:
-            return AIExtractor._get_empty_extraction()
-
 # ==================== AI Document Extractor ====================
 class AIExtractor:
     @staticmethod
@@ -420,32 +309,20 @@ class AIExtractor:
         try:
             image = Image.open(image_path)
             text = pytesseract.image_to_string(image)
-            result = AIExtractor._parse_document_text(text)
-            result["method"] = "ocr"
-            result["confidence"] = 0.7  # Default confidence for OCR
-            return result
+            return AIExtractor._parse_document_text(text)
         except Exception as e:
             print(f"OCR error: {e}")
-            result = AIExtractor._get_empty_extraction()
-            result["method"] = "failed"
-            result["confidence"] = 0.0
-            return result
+            return AIExtractor._get_empty_extraction()
     
     @staticmethod
     async def extract_from_pdf(pdf_path: str) -> Dict[str, Any]:
         try:
             images = pdf2image.convert_from_path(pdf_path, first_page=1, last_page=3)
             text = "".join(pytesseract.image_to_string(img) for img in images)
-            result = AIExtractor._parse_document_text(text)
-            result["method"] = "ocr"
-            result["confidence"] = 0.7
-            return result
+            return AIExtractor._parse_document_text(text)
         except Exception as e:
             print(f"PDF extraction error: {e}")
-            result = AIExtractor._get_empty_extraction()
-            result["method"] = "failed"
-            result["confidence"] = 0.0
-            return result
+            return AIExtractor._get_empty_extraction()
     
     @staticmethod
     def _parse_document_text(text: str) -> Dict[str, Any]:
@@ -509,11 +386,13 @@ class DuplicateDetector:
     @staticmethod
     def check_duplicate(db: Session, invoice_number: Optional[str], vendor_name: Optional[str],
                         amount: Optional[float], file_content: bytes, document_type: str) -> Tuple[bool, Optional[str]]:
+        # 1. File hash duplicate
         file_hash = hashlib.sha256(file_content).hexdigest()
         existing_file = db.query(Document).filter(Document.file_hash == file_hash).first()
         if existing_file:
             return True, f"Duplicate file content detected (Document #{existing_file.id})"
 
+        # 2. Invoice number match – but allow credit notes referencing original invoice
         if invoice_number:
             existing = db.query(Document).filter(Document.invoice_number == invoice_number).first()
             if existing:
@@ -521,6 +400,7 @@ class DuplicateDetector:
                     return False, None
                 return True, f"Duplicate invoice number: {invoice_number} (Document #{existing.id})"
 
+        # 3. Vendor + amount secondary check (only for invoices)
         if document_type == "invoice" and vendor_name and amount:
             thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
             dup = db.query(Document).filter(
@@ -542,13 +422,16 @@ async def lifespan(app: FastAPI):
     print("🚀 Starting Document Management System...")
     print(f"📊 Database Type: {Config.DATABASE_TYPE}")
     
+    # Create tables
     if engine:
         Base.metadata.create_all(bind=engine)
         print("✅ Database tables created/verified")
     
+    # Create upload directory
     os.makedirs(Config.UPLOAD_DIR, exist_ok=True)
     print(f"✅ Upload directory: {Config.UPLOAD_DIR}")
     
+    # Create default users
     db = SessionLocal()
     try:
         default_users = [
@@ -609,7 +492,7 @@ app.add_middleware(
 @app.get("/")
 async def root():
     return RedirectResponse(url="/login.html")
-    
+
 # ==================== Authentication Routes ====================
 @app.post("/api/auth/login", response_model=Token)
 async def login(
@@ -638,16 +521,18 @@ async def login(
         max_age=Config.ACCESS_TOKEN_EXPIRE_MINUTES * 60
     )
     
+    # Log audit
     audit = AuditLog(
         user_id=user.id, 
         action="LOGIN", 
         details="User logged in", 
-        ip_address=request.client.host if request.client else "unknown"
+        ip_address=request.client.host if hasattr(request, 'client') else "unknown"
     )
     db.add(audit)
     db.commit()
-    
-    return {"access_token": token, "token_type": "bearer", "role": user.role.value}
+    return {
+    "access_token": token, "token_type": "bearer"
+}
 
 @app.post("/api/auth/logout")
 async def logout(response: Response):
@@ -673,7 +558,6 @@ async def upload_document(
     current_user: User = Depends(role_required([UserRole.ADMIN, UserRole.APPROVER, UserRole.MANAGER])),
     db: Session = Depends(get_db)
 ):
-    """Upload invoices and credit notes only"""
     if document_type not in ["invoice", "credit_note"]:
         raise HTTPException(400, "Document type must be 'invoice' or 'credit_note'")
     
@@ -686,11 +570,13 @@ async def upload_document(
         f.write(content)
     
     file_hash = hashlib.sha256(content).hexdigest()
+    ext = os.path.splitext(file.filename)[1].lower()
     
-    # Extract data using AI
-    extracted = await DocumentExtractor.extract(file_path, document_type)
+    if ext == ".pdf":
+        extracted = await AIExtractor.extract_from_pdf(file_path)
+    else:
+        extracted = await AIExtractor.extract_from_image(file_path)
     
-    # Check for duplicates
     is_dup, dup_reason = DuplicateDetector.check_duplicate(
         db, extracted.get("invoice_number"), extracted.get("vendor_name"),
         extracted.get("amount"), content, document_type
@@ -709,35 +595,26 @@ async def upload_document(
         uploaded_by=current_user.id,
         status=ApprovalStatus.PENDING_LEVEL1,
         is_duplicate=is_dup,
-        duplicate_reason=dup_reason,
-        extraction_method=extracted.get("method", "unknown"),
-        extraction_confidence=extracted.get("confidence", 0.0)
+        duplicate_reason=dup_reason
     )
     db.add(doc)
     db.commit()
     db.refresh(doc)
     
+    # Log audit
     audit = AuditLog(
         user_id=current_user.id, 
         action="UPLOAD", 
         details=f"Uploaded {file.filename} (ID: {doc.id})", 
-        ip_address=request.client.host if request.client else "unknown"
+        ip_address=request.client.host if hasattr(request, 'client') else "unknown"
     )
     db.add(audit)
     db.commit()
     
     return {
-        "message": "Document uploaded successfully",
+        "message": "Document uploaded",
         "document_id": doc.id,
-        "extracted_data": {
-            "vendor_name": extracted.get("vendor_name"),
-            "invoice_number": extracted.get("invoice_number"),
-            "invoice_date": extracted.get("invoice_date"),
-            "amount": extracted.get("amount"),
-            "vat_amount": extracted.get("vat_amount")
-        },
-        "extraction_method": extracted.get("method"),
-        "extraction_confidence": extracted.get("confidence", 0),
+        "extracted_data": extracted,
         "is_duplicate": is_dup,
         "duplicate_reason": dup_reason,
         "status": doc.status.value
@@ -767,12 +644,9 @@ async def list_documents(
             "vendor_name": d.vendor_name,
             "invoice_number": d.invoice_number,
             "amount": d.amount,
-            "vat_amount": d.vat_amount,
             "status": d.status.value,
             "upload_date": d.upload_date,
-            "is_duplicate": d.is_duplicate,
-            "extraction_method": d.extraction_method,
-            "extraction_confidence": d.extraction_confidence
+            "is_duplicate": d.is_duplicate
         }
         for d in docs
     ]
@@ -805,24 +679,20 @@ async def get_document(
             "status": doc.status.value,
             "upload_date": doc.upload_date,
             "is_duplicate": doc.is_duplicate,
-            "duplicate_reason": doc.duplicate_reason,
-            "extraction_method": doc.extraction_method,
-            "extraction_confidence": doc.extraction_confidence,
-            "rejection_reason": doc.rejection_reason
+            "duplicate_reason": doc.duplicate_reason
         },
         "approval_history": [
             {
                 "level": a.approval_level,
                 "decision": a.decision,
                 "comments": a.comments,
-                "approved_at": a.approved_at,
-                "approver_name": a.approver.full_name if a.approver else "Unknown"
+                "approved_at": a.approved_at
             }
             for a in approvals
         ]
     }
 
-# ==================== Approval Routes (3-Step Workflow) ====================
+# ==================== Approval Routes (3-step) ====================
 @app.post("/api/approval/process")
 async def process_approval(
     action: ApprovalAction,
@@ -837,7 +707,6 @@ async def process_approval(
     if doc.status in [ApprovalStatus.APPROVED, ApprovalStatus.REJECTED]:
         raise HTTPException(400, f"Document already {doc.status.value}")
     
-    # Determine which approval level this user can perform
     allowed_level = None
     if current_user.role == UserRole.APPROVER and doc.status == ApprovalStatus.PENDING_LEVEL1:
         allowed_level = 1
@@ -846,12 +715,11 @@ async def process_approval(
     elif current_user.role == UserRole.ADMIN and doc.status == ApprovalStatus.PENDING_LEVEL3:
         allowed_level = 3
     else:
-        raise HTTPException(403, f"Not authorized for this approval stage. Current status: {doc.status.value}")
+        raise HTTPException(403, "Not authorized for this approval stage")
     
     if action.decision not in ["approved", "rejected"]:
         raise HTTPException(400, "Decision must be 'approved' or 'rejected'")
     
-    # Create approval record
     approval = Approval(
         document_id=doc.id,
         approver_id=current_user.id,
@@ -861,30 +729,28 @@ async def process_approval(
     )
     db.add(approval)
     
-    # Update document status based on decision
     if action.decision == "rejected":
         doc.status = ApprovalStatus.REJECTED
-        doc.rejection_reason = action.comments
-        message = f"Document #{doc.id} REJECTED at level {allowed_level} by {current_user.role.value}"
+        message = f"Document #{doc.id} rejected at level {allowed_level}"
     else:
-        # Move to next level or approve
         if allowed_level == 1:
             doc.status = ApprovalStatus.PENDING_LEVEL2
-            message = f"Document #{doc.id} approved at Level 1, now pending Level 2 (Manager) approval"
+            message = f"Document #{doc.id} approved at level 1, moved to level 2"
         elif allowed_level == 2:
             doc.status = ApprovalStatus.PENDING_LEVEL3
-            message = f"Document #{doc.id} approved at Level 2, now pending Level 3 (Admin/Finance) approval"
-        else:  # Level 3 approval
+            message = f"Document #{doc.id} approved at level 2, moved to level 3"
+        else:
             doc.status = ApprovalStatus.APPROVED
-            message = f"Document #{doc.id} FULLY APPROVED"
+            message = f"Document #{doc.id} fully approved"
     
     db.commit()
     
+    # Log audit
     audit = AuditLog(
         user_id=current_user.id, 
         action="APPROVAL", 
         details=f"Document {doc.id} {action.decision} at level {allowed_level}", 
-        ip_address=request.client.host if request.client else "unknown"
+        ip_address=request.client.host if hasattr(request, 'client') else "unknown"
     )
     db.add(audit)
     db.commit()
@@ -893,8 +759,7 @@ async def process_approval(
         "message": message,
         "document_id": doc.id,
         "status": doc.status.value,
-        "approval_level": allowed_level,
-        "decision": action.decision
+        "approval_level": allowed_level
     }
 
 @app.get("/api/approval/pending")
@@ -902,7 +767,6 @@ async def get_pending_approvals(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Get documents pending approval for the current user's role"""
     if current_user.role == UserRole.APPROVER:
         docs = db.query(Document).filter(Document.status == ApprovalStatus.PENDING_LEVEL1).all()
     elif current_user.role == UserRole.MANAGER:
@@ -916,13 +780,10 @@ async def get_pending_approvals(
         {
             "id": d.id,
             "filename": d.filename,
-            "document_type": d.document_type,
             "vendor_name": d.vendor_name,
-            "invoice_number": d.invoice_number,
             "amount": d.amount,
             "status": d.status.value,
-            "upload_date": d.upload_date,
-            "extraction_confidence": d.extraction_confidence
+            "upload_date": d.upload_date
         }
         for d in docs
     ]
@@ -934,7 +795,6 @@ async def spend_summary(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Spend summary report with various filters"""
     if current_user.role == UserRole.VIEWER:
         query = db.query(Document).filter(Document.status == ApprovalStatus.APPROVED)
     else:
@@ -945,15 +805,13 @@ async def spend_summary(
     if filters.end_date:
         query = query.filter(Document.invoice_date <= filters.end_date)
     if filters.vendor_name:
-        query = query.filter(Document.vendor_name.ilike(f"%{filters.vendor_name}%"))
+        query = query.filter(Document.vendor_name.contains(filters.vendor_name))
     if filters.status:
         query = query.filter(Document.status == filters.status)
     if filters.min_amount is not None:
         query = query.filter(Document.amount >= filters.min_amount)
     if filters.max_amount is not None:
         query = query.filter(Document.amount <= filters.max_amount)
-    if filters.document_type:
-        query = query.filter(Document.document_type == filters.document_type)
 
     docs = query.all()
     if not docs:
@@ -961,20 +819,22 @@ async def spend_summary(
 
     total_amount = sum(d.amount or 0 for d in docs)
     total_vat = sum(d.vat_amount or 0 for d in docs)
-    
     vendor_breakdown = {}
     for d in docs:
         if d.vendor_name:
             vendor_breakdown[d.vendor_name] = vendor_breakdown.get(d.vendor_name, 0) + (d.amount or 0)
-    
     monthly_trend = {}
     for d in docs:
         if d.invoice_date:
             month_key = d.invoice_date.strftime("%Y-%m")
             monthly_trend[month_key] = monthly_trend.get(month_key, 0) + (d.amount or 0)
-    
+
+    if current_user.role == UserRole.VIEWER:
+        all_accessible = db.query(Document).filter(Document.status == ApprovalStatus.APPROVED).all()
+    else:
+        all_accessible = db.query(Document).all()
     status_counts = {s.value: 0 for s in ApprovalStatus}
-    for d in docs:
+    for d in all_accessible:
         status_counts[d.status.value] += 1
 
     return {
@@ -983,8 +843,7 @@ async def spend_summary(
             "total_vat": total_vat,
             "total_without_vat": total_amount - total_vat,
             "document_count": len(docs),
-            "unique_vendors": len(vendor_breakdown),
-            "average_amount": total_amount / len(docs) if docs else 0
+            "unique_vendors": len(vendor_breakdown)
         },
         "vendor_breakdown": vendor_breakdown,
         "monthly_trend": monthly_trend,
@@ -996,43 +855,39 @@ async def spend_summary(
                 "invoice_number": d.invoice_number,
                 "date": d.invoice_date,
                 "amount": d.amount,
-                "vat": d.vat_amount,
-                "status": d.status.value
+                "vat": d.vat_amount
             }
-            for d in docs[:100]
+            for d in docs[:50]
         ]
     }
 
-@app.post("/api/reports/tax")
+@app.get("/api/reports/tax")
 async def tax_report(
-    filters: ReportFilter,
+    start_date: Optional[datetime] = Query(None),
+    end_date: Optional[datetime] = Query(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Tax/VAT report"""
     if current_user.role == UserRole.VIEWER:
         query = db.query(Document).filter(Document.status == ApprovalStatus.APPROVED)
     else:
         query = db.query(Document)
     
-    if filters.start_date:
-        query = query.filter(Document.invoice_date >= filters.start_date)
-    if filters.end_date:
-        query = query.filter(Document.invoice_date <= filters.end_date)
-    if filters.vendor_name:
-        query = query.filter(Document.vendor_name.ilike(f"%{filters.vendor_name}%"))
+    if start_date:
+        query = query.filter(Document.invoice_date >= start_date)
+    if end_date:
+        query = query.filter(Document.invoice_date <= end_date)
     
     docs = query.all()
     total_taxable = sum(d.amount or 0 for d in docs)
     total_vat = sum(d.vat_amount or 0 for d in docs)
-    
     vendor_tax = {}
     for d in docs:
         if d.vendor_name:
             vendor_tax[d.vendor_name] = vendor_tax.get(d.vendor_name, 0) + (d.vat_amount or 0)
     
     return {
-        "period": {"start_date": filters.start_date, "end_date": filters.end_date},
+        "period": {"start_date": start_date, "end_date": end_date},
         "summary": {
             "total_taxable_amount": total_taxable,
             "total_vat_collected": total_vat,
@@ -1047,14 +902,13 @@ async def tax_report(
                 "invoice_number": d.invoice_number,
                 "date": d.invoice_date,
                 "taxable_amount": d.amount,
-                "vat_amount": d.vat_amount,
-                "tax_rate": ((d.vat_amount / d.amount) * 100) if d.amount and d.vat_amount else 0
+                "vat_amount": d.vat_amount
             }
-            for d in docs[:100]
+            for d in docs[:50]
         ]
     }
 
-# ==================== Export Routes ====================
+# Export endpoints
 @app.get("/api/reports/export/excel")
 async def export_excel(
     start_date: Optional[datetime] = Query(None),
@@ -1066,7 +920,6 @@ async def export_excel(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Export report to Excel"""
     if current_user.role == UserRole.VIEWER:
         query = db.query(Document).filter(Document.status == ApprovalStatus.APPROVED)
     else:
@@ -1077,7 +930,7 @@ async def export_excel(
     if end_date:
         query = query.filter(Document.invoice_date <= end_date)
     if vendor_name:
-        query = query.filter(Document.vendor_name.ilike(f"%{vendor_name}%"))
+        query = query.filter(Document.vendor_name.contains(vendor_name))
     if status:
         query = query.filter(Document.status == status)
     if min_amount is not None:
@@ -1098,10 +951,7 @@ async def export_excel(
             "Amount": d.amount or 0,
             "VAT Amount": d.vat_amount or 0,
             "Status": d.status.value,
-            "Upload Date": d.upload_date,
-            "Extraction Method": d.extraction_method,
-            "Extraction Confidence": f"{d.extraction_confidence*100:.1f}%" if d.extraction_confidence else "N/A",
-            "Is Duplicate": "Yes" if d.is_duplicate else "No"
+            "Upload Date": d.upload_date
         })
     
     df = pd.DataFrame(data)
@@ -1136,7 +986,6 @@ async def export_pdf(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Export report to PDF"""
     if current_user.role == UserRole.VIEWER:
         query = db.query(Document).filter(Document.status == ApprovalStatus.APPROVED)
     else:
@@ -1147,7 +996,7 @@ async def export_pdf(
     if end_date:
         query = query.filter(Document.invoice_date <= end_date)
     if vendor_name:
-        query = query.filter(Document.vendor_name.ilike(f"%{vendor_name}%"))
+        query = query.filter(Document.vendor_name.contains(vendor_name))
     if status:
         query = query.filter(Document.status == status)
     if min_amount is not None:
@@ -1157,20 +1006,19 @@ async def export_pdf(
 
     docs = query.limit(100).all()
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=landscape(letter))
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
     styles = getSampleStyleSheet()
     elements = []
-    
-    title = Paragraph(f"Document Management Report - {datetime.now().strftime('%Y-%m-%d %H:%M')}", styles['Title'])
+    title = Paragraph(f"Document Management Report - {datetime.now().strftime('%Y-%m-%d')}", styles['Title'])
     elements.append(title)
-    elements.append(Spacer(1, 12))
+    elements.append(Paragraph("<br/><br/>", styles['Normal']))
     
     total_amount = sum(d.amount or 0 for d in docs)
     elements.append(Paragraph(f"<b>Total Amount:</b> ${total_amount:,.2f}", styles['Normal']))
     elements.append(Paragraph(f"<b>Number of Documents:</b> {len(docs)}", styles['Normal']))
-    elements.append(Spacer(1, 12))
+    elements.append(Paragraph("<br/>", styles['Normal']))
     
-    table_data = [["ID", "Vendor", "Invoice #", "Date", "Amount", "VAT", "Status"]]
+    table_data = [["ID", "Vendor", "Invoice #", "Date", "Amount", "VAT"]]
     for d in docs:
         table_data.append([
             str(d.id),
@@ -1178,8 +1026,7 @@ async def export_pdf(
             (d.invoice_number or "")[:20],
             d.invoice_date.strftime("%Y-%m-%d") if d.invoice_date else "",
             f"${d.amount:,.2f}" if d.amount else "$0.00",
-            f"${d.vat_amount:,.2f}" if d.vat_amount else "$0.00",
-            d.status.value[:15]
+            f"${d.vat_amount:,.2f}" if d.vat_amount else "$0.00"
         ])
     
     table = Table(table_data)
@@ -1204,13 +1051,130 @@ async def export_pdf(
         headers={"Content-Disposition": f"attachment; filename=report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"}
     )
 
+# Tax export endpoints
+@app.get("/api/reports/export/tax-excel")
+async def export_tax_excel(
+    start_date: Optional[datetime] = Query(None),
+    end_date: Optional[datetime] = Query(None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if current_user.role == UserRole.VIEWER:
+        query = db.query(Document).filter(Document.status == ApprovalStatus.APPROVED)
+    else:
+        query = db.query(Document)
+    
+    if start_date:
+        query = query.filter(Document.invoice_date >= start_date)
+    if end_date:
+        query = query.filter(Document.invoice_date <= end_date)
+    
+    docs = query.all()
+    data = []
+    for d in docs:
+        data.append({
+            "Document ID": d.id,
+            "Vendor": d.vendor_name or "",
+            "Invoice Number": d.invoice_number or "",
+            "Invoice Date": d.invoice_date,
+            "Taxable Amount": d.amount or 0,
+            "VAT Amount": d.vat_amount or 0,
+            "Status": d.status.value
+        })
+    
+    df = pd.DataFrame(data)
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name='Tax Report', index=False)
+        if data:
+            summary = pd.DataFrame([
+                ["Total Taxable Amount", df["Taxable Amount"].sum()],
+                ["Total VAT Collected", df["VAT Amount"].sum()],
+                ["Number of Transactions", len(df)],
+                ["Effective Tax Rate", f"{(df['VAT Amount'].sum() / df['Taxable Amount'].sum() * 100) if df['Taxable Amount'].sum() > 0 else 0:.2f}%"]
+            ], columns=["Metric", "Value"])
+            summary.to_excel(writer, sheet_name='Summary', index=False)
+    
+    output.seek(0)
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=tax_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"}
+    )
+
+@app.get("/api/reports/export/tax-pdf")
+async def export_tax_pdf(
+    start_date: Optional[datetime] = Query(None),
+    end_date: Optional[datetime] = Query(None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if current_user.role == UserRole.VIEWER:
+        query = db.query(Document).filter(Document.status == ApprovalStatus.APPROVED)
+    else:
+        query = db.query(Document)
+    
+    if start_date:
+        query = query.filter(Document.invoice_date >= start_date)
+    if end_date:
+        query = query.filter(Document.invoice_date <= end_date)
+    
+    docs = query.limit(100).all()
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    styles = getSampleStyleSheet()
+    elements = []
+    title = Paragraph(f"Tax / VAT Report - {datetime.now().strftime('%Y-%m-%d')}", styles['Title'])
+    elements.append(title)
+    elements.append(Paragraph("<br/><br/>", styles['Normal']))
+    
+    total_taxable = sum(d.amount or 0 for d in docs)
+    total_vat = sum(d.vat_amount or 0 for d in docs)
+    elements.append(Paragraph(f"<b>Total Taxable Amount:</b> ${total_taxable:,.2f}", styles['Normal']))
+    elements.append(Paragraph(f"<b>Total VAT Collected:</b> ${total_vat:,.2f}", styles['Normal']))
+    elements.append(Paragraph(f"<b>Effective Tax Rate:</b> {(total_vat / total_taxable * 100) if total_taxable > 0 else 0:.2f}%", styles['Normal']))
+    elements.append(Paragraph(f"<b>Number of Transactions:</b> {len(docs)}", styles['Normal']))
+    elements.append(Paragraph("<br/>", styles['Normal']))
+    
+    table_data = [["ID", "Vendor", "Invoice #", "Date", "Taxable Amount", "VAT Amount"]]
+    for d in docs:
+        table_data.append([
+            str(d.id),
+            (d.vendor_name or "")[:30],
+            (d.invoice_number or "")[:20],
+            d.invoice_date.strftime("%Y-%m-%d") if d.invoice_date else "",
+            f"${d.amount:,.2f}" if d.amount else "$0.00",
+            f"${d.vat_amount:,.2f}" if d.vat_amount else "$0.00"
+        ])
+    
+    table = Table(table_data)
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.grey),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0,0), (-1,0), 10),
+        ('BOTTOMPADDING', (0,0), (-1,0), 12),
+        ('BACKGROUND', (0,1), (-1,-1), colors.beige),
+        ('GRID', (0,0), (-1,-1), 1, colors.black),
+        ('FONTSIZE', (0,1), (-1,-1), 8),
+    ]))
+    elements.append(table)
+    doc.build(elements)
+    buffer.seek(0)
+    
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=tax_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"}
+    )
+
 # ==================== Analytics Routes ====================
 @app.get("/api/analytics/insights")
 async def get_ai_insights(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """AI-driven insights on spending patterns, trends, and anomalies"""
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=365)
     
@@ -1236,7 +1200,6 @@ async def get_ai_insights(
         if d.vendor_name and d.amount:
             vendor_spending[d.vendor_name] = vendor_spending.get(d.vendor_name, 0) + d.amount
     
-    # Detect anomalies (transactions > 2 standard deviations from mean)
     anomalies = []
     if len(amounts) > 1:
         mean_amt = np.mean(amounts)
@@ -1251,22 +1214,19 @@ async def get_ai_insights(
                     "reason": f"Amount is {((d.amount - mean_amt) / std_amt):.1f} standard deviations above mean"
                 })
     
-    # Generate insights
     insights = []
     monthly_values = list(monthly_spending.values())
     if len(monthly_values) >= 2:
         change = ((monthly_values[-1] - monthly_values[-2]) / monthly_values[-2] * 100) if monthly_values[-2] > 0 else 0
-        if change > 10:
-            insights.append(f"📈 Significant spending increase of {change:.1f}% compared to last month")
-        elif change < -10:
-            insights.append(f"📉 Significant spending decrease of {abs(change):.1f}% compared to last month")
-        elif change != 0:
-            insights.append(f"📊 Spending changed by {change:.1f}% compared to last month")
+        if change > 0:
+            insights.append(f"📈 Spending increased by {change:.1f}% compared to last month")
+        elif change < 0:
+            insights.append(f"📉 Spending decreased by {abs(change):.1f}% compared to last month")
     
     top_vendors = sorted(vendor_spending.items(), key=lambda x: x[1], reverse=True)[:3]
     if top_vendors:
         vendors_text = ", ".join([f"{v} (${a:,.0f})" for v, a in top_vendors])
-        insights.append(f"🏢 Top 3 vendors by spending: {vendors_text}")
+        insights.append(f"🏢 Top 3 vendors: {vendors_text}")
     
     avg_amount = np.mean(amounts) if amounts else 0
     insights.append(f"💰 Average transaction amount: ${avg_amount:,.2f}")
@@ -1274,24 +1234,10 @@ async def get_ai_insights(
     if monthly_spending:
         highest_month = max(monthly_spending, key=monthly_spending.get)
         insights.append(f"📅 Highest spending month: {highest_month} (${monthly_spending[highest_month]:,.2f})")
-        
-        lowest_month = min(monthly_spending, key=monthly_spending.get)
-        if lowest_month != highest_month:
-            insights.append(f"📅 Lowest spending month: {lowest_month} (${monthly_spending[lowest_month]:,.2f})")
     
     total_vat = sum(d.vat_amount or 0 for d in docs)
     if total_vat > 0:
         insights.append(f"🧾 Total VAT collected: ${total_vat:,.2f}")
-    
-    # Duplicate insights
-    duplicate_count = sum(1 for d in docs if d.is_duplicate)
-    if duplicate_count > 0:
-        insights.append(f"⚠️ Found {duplicate_count} duplicate documents - review your upload process")
-    
-    # Approval insights
-    pending_count = sum(1 for d in docs if d.status in [ApprovalStatus.PENDING_LEVEL1, ApprovalStatus.PENDING_LEVEL2, ApprovalStatus.PENDING_LEVEL3])
-    if pending_count > 5:
-        insights.append(f"⏳ {pending_count} documents pending approval - action required")
     
     return {
         "insights": insights,
@@ -1302,9 +1248,7 @@ async def get_ai_insights(
             "median_transaction": np.median(amounts) if amounts else 0,
             "total_transactions": len(docs),
             "unique_vendors": len(vendor_spending),
-            "total_vat": total_vat,
-            "duplicate_count": duplicate_count,
-            "pending_approvals": pending_count
+            "total_vat": total_vat
         },
         "trends": {
             "monthly_spending": monthly_spending,
@@ -1317,7 +1261,6 @@ async def get_spending_forecast(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Forecast future spending based on historical data"""
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=180)
     
@@ -1347,13 +1290,13 @@ async def get_spending_forecast(
         return {
             "forecast_next_month": round(forecast, 2),
             "confidence_interval": {
-                "lower": round(max(0, forecast - confidence_interval), 2),
+                "lower": round(forecast - confidence_interval, 2),
                 "upper": round(forecast + confidence_interval, 2)
             },
             "trend": trend,
             "data_points": len(monthly_values),
             "historical_average": round(np.mean(monthly_values), 2),
-            "recommendation": "Budget accordingly for next month based on increasing trend" if forecast > np.mean(monthly_values) else "Expected spending to remain stable or decrease"
+            "recommendation": "Budget accordingly for next month based on the forecast" if forecast > np.mean(monthly_values) else "Expected spending to remain stable or decrease"
         }
     else:
         return {"message": f"Need at least 3 months of data for forecast. Currently have {len(monthly_values)} months."}
@@ -1426,43 +1369,11 @@ async def get_audit_logs(
         ]
     }
 
-@app.get("/api/system/extraction-stats")
-async def get_extraction_stats(
-    current_user: User = Depends(role_required([UserRole.ADMIN])),
-    db: Session = Depends(get_db)
-):
-    stats = db.query(
-        Document.extraction_method,
-        func.count(Document.id).label('count'),
-        func.avg(Document.extraction_confidence).label('avg_confidence')
-    ).group_by(Document.extraction_method).all()
-    
-    return {
-        "extraction_stats": [
-            {
-                "method": stat[0],
-                "count": stat[1],
-                "avg_confidence": float(stat[2]) if stat[2] else 0
-            }
-            for stat in stats
-        ],
-        "total_documents": db.query(Document).count(),
-        "low_confidence_documents": db.query(Document).filter(Document.extraction_confidence < Config.CONFIDENCE_THRESHOLD).count(),
-        "openai_enabled": Config.USE_OPENAI and bool(Config.OPENAI_API_KEY),
-        "openai_model": Config.OPENAI_MODEL if Config.USE_OPENAI else None
-    }
-
 @app.get("/health")
 async def health():
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now(timezone.utc),
-        "openai_configured": bool(Config.OPENAI_API_KEY),
-        "openai_enabled": Config.USE_OPENAI
-    }
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc)}
 
-# ==================== Static Files ====================
-
+# Mount static files (make sure static directory exists)
 if os.path.exists("static"):
     app.mount("/", StaticFiles(directory="static", html=True), name="static")
 else:
@@ -1471,20 +1382,12 @@ else:
 # ==================== Main ====================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
-    add_missing_columns()
     print("=" * 60)
     print("📄 Document Management System Starting...")
     print("=" * 60)
-    print(f"🌐 Server: http://0.0.0.0:{port}")
-    print(f"📚 API Docs: http://0.0.0.0:{port}/docs")
-    print(f"🗄️  Database: {Config.get_database_url()}")
-    print(f"🤖 OpenAI: {'Enabled' if Config.USE_OPENAI and Config.OPENAI_API_KEY else 'Disabled'}")
-    print("=" * 60)
-    print("Default Login Credentials:")
-    print("  👑 Admin:    admin / Admin@123")
-    print("  ✅ Approver: approver / Approver@123")
-    print("  📊 Manager:  manager / Manager@123")
-    print("  👁️ Viewer:   viewer / Viewer@123")
+    print(f"🌐 Server will run on: http://0.0.0.0:{port}")
+    print(f"📚 API Documentation: http://0.0.0.0:{port}/docs")
+    print(f"🗄️  Database: {Config.DATABASE_TYPE.upper()}")
     print("=" * 60)
     
     uvicorn.run(
