@@ -22,7 +22,7 @@ from passlib.context import CryptContext
 
 # Document processing
 import pytesseract
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image
 import pdf2image
 
 # Data processing and reporting
@@ -62,7 +62,7 @@ class Config:
     MYSQL_DB = os.getenv("MYSQL_DB", "doc_management")
 
     # Database selection
-    DATABASE_TYPE = os.getenv("DATABASE_TYPE", "postgresql").lower()
+    DATABASE_TYPE = os.getenv("DATABASE_TYPE", "postgresql").lower()  # postgresql, mysql, sqlite
     
     # Render.com PostgreSQL URL (automatically provided)
     RENDER_DATABASE_URL = os.getenv("DATABASE_URL")
@@ -75,13 +75,16 @@ class Config:
 
     @classmethod
     def get_database_url(cls):
+        # Priority 1: Use Render.com DATABASE_URL if available (PostgreSQL)
         if cls.RENDER_DATABASE_URL:
             print(f"✅ Using Render.com PostgreSQL database")
+            # Convert postgres:// to postgresql:// for SQLAlchemy
             database_url = cls.RENDER_DATABASE_URL
             if database_url.startswith("postgres://"):
                 database_url = database_url.replace("postgres://", "postgresql://", 1)
             return database_url
         
+        # Priority 2: Use specified DATABASE_TYPE
         if cls.DATABASE_TYPE == "postgresql":
             print(f"✅ Using PostgreSQL database at {cls.PG_HOST}:{cls.PG_PORT}")
             return f"postgresql://{cls.PG_USER}:{cls.PG_PASSWORD}@{cls.PG_HOST}:{cls.PG_PORT}/{cls.PG_DB}"
@@ -137,8 +140,6 @@ class Document(Base):
     status = Column(SQLEnum(ApprovalStatus), default=ApprovalStatus.PENDING_LEVEL1)
     is_duplicate = Column(Boolean, default=False)
     duplicate_reason = Column(Text)
-    extraction_confidence = Column(Float, default=0.0)
-    extracted_raw_text = Column(Text)
     uploader = relationship("User")
 
 class Approval(Base):
@@ -160,19 +161,29 @@ class AuditLog(Base):
     ip_address = Column(String(45))
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
-# Create engine
+# Create engine with proper error handling
 engine = None
 SessionLocal = None
 
 try:
     database_url = Config.get_database_url()
-    
-    if "sqlite" in database_url:
-        engine = create_engine(database_url, connect_args={"check_same_thread": False})
-    elif "postgresql" in database_url:
-        engine = create_engine(database_url, pool_pre_ping=True, pool_size=10, max_overflow=20, pool_recycle=3600, echo=False)
-    else:
-        engine = create_engine(database_url, pool_pre_ping=True, pool_recycle=3600)
+
+    if "postgresql" in database_url:
+        # PostgreSQL specific configuration
+        engine = create_engine(
+            database_url,
+            pool_pre_ping=True,
+            pool_size=10,
+            max_overflow=20,
+            pool_recycle=3600,
+            echo=False
+        )
+    else:  # MySQL
+        engine = create_engine(
+            database_url, 
+            pool_pre_ping=True,
+            pool_recycle=3600
+        )
     
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     print("✅ Database engine created successfully")
@@ -181,7 +192,10 @@ except Exception as e:
     print(f"❌ Database connection error: {e}")
     print("⚠️ Falling back to SQLite...")
     Config.DATABASE_TYPE = "sqlite"
-    engine = create_engine(Config.SQLITE_URL, connect_args={"check_same_thread": False})
+    engine = create_engine(
+        Config.SQLITE_URL, 
+        connect_args={"check_same_thread": False}
+    )
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     print("✅ SQLite fallback engine created")
 
@@ -288,293 +302,97 @@ def generate_secure_filename(original: str) -> str:
     ext = os.path.splitext(original)[1].lower()
     return f"{uuid.uuid4().hex}{ext}"
 
-# ==================== Enhanced AI Document Extractor ====================
+# ==================== AI Document Extractor ====================
 class AIExtractor:
-    
-    PATTERNS = {
-        "vendor_name": [
-            r"(?:Vendor|Supplier|Company|Bill From|Seller|Issuer|Sold by)[\s:]+([A-Za-z0-9\s&.,'-]+)(?:\n|$)",
-            r"^(?:From|Vendor|Supplier):\s*([A-Za-z0-9\s&.,'-]+)(?:\n|$)",
-            r"([A-Za-z0-9\s&.,'-]+)(?:\n)(?:Invoice|Bill|Statement)",
-            r"(?:Company|Business)[\s:]+([A-Za-z0-9\s&.,'-]+)",
-            r"^([A-Za-z0-9\s&.,'-]+)(?:\n)(?:Address|Phone|Email)",
-        ],
-        "invoice_number": [
-            r"(?:Invoice|Document|Bill|Statement)[\s#:]+(\S+)",
-            r"(?:INV|INVOICE|INV-#|Invoice Number)[\s\-:]*([A-Z0-9\-]+)",
-            r"Number[\s:]+([A-Z0-9\-]+)",
-            r"Ref(?:erence)?[\s:]+([A-Z0-9\-]+)",
-            r"Order #:\s*(\S+)",
-        ],
-        "invoice_date": [
-            r"(?:Date|Invoice Date|Issue Date|Date of Issue)[\s:]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-            r"(?:Date|Invoice Date)[\s:]+(\d{4}-\d{2}-\d{2})",
-            r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-            r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}",
-        ],
-        "due_date": [
-            r"(?:Due Date|Payment Due|Pay by)[\s:]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-            r"(?:Due Date)[\s:]+(\d{4}-\d{2}-\d{2})",
-        ],
-        "po_number": [
-            r"(?:PO|Purchase Order|Order)[\s#:]+(\S+)",
-            r"PO\s*#?\s*([A-Z0-9\-]+)",
-        ],
-        "amount": [
-            r"(?:Total|Amount Due|Grand Total|Balance Due|Invoice Total)[\s:]*[$€£]?([\d,]+\.?\d*)",
-            r"TOTAL\s+[$€£]?([\d,]+\.?\d*)",
-            r"Amount\s+[Dd]ue:\s*[$€£]?([\d,]+\.?\d*)",
-            r"Net Amount:\s*[$€£]?([\d,]+\.?\d*)",
-            r"Subtotal:\s*[$€£]?([\d,]+\.?\d*)",
-        ],
-        "vat_amount": [
-            r"(?:VAT|Tax|GST|HST|IVA|TVQ)[\s:]*[$€£]?([\d,]+\.?\d*)",
-            r"Tax Amount\s+[$€£]?([\d,]+\.?\d*)",
-            r"VAT\s+[@%]?\s*\d+%?\s+[$€£]?([\d,]+\.?\d*)",
-            r"(?:GST|HST):\s*[$€£]?([\d,]+\.?\d*)",
-        ],
-        "tax_rate": [
-            r"VAT\s+(\d+(?:\.\d+)?)%",
-            r"Tax\s+(\d+(?:\.\d+)?)%",
-            r"GST\s+(\d+(?:\.\d+)?)%",
-        ]
-    }
-    
     @staticmethod
-    async def extract_from_image(image_path: str):
+    async def extract_from_image(image_path: str) -> Dict[str, Any]:
         try:
             image = Image.open(image_path)
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
-            
-            enhancer = ImageEnhance.Contrast(image)
-            image = enhancer.enhance(2.0)
-            image = image.filter(ImageFilter.SHARPEN)
-            
-            if max(image.size) > 2000:
-                ratio = 2000 / max(image.size)
-                new_size = tuple(int(dim * ratio) for dim in image.size)
-                image = image.resize(new_size, Image.Resampling.LANCZOS)
-            
-            configs = ['--oem 3 --psm 6', '--oem 3 --psm 4', '--oem 3 --psm 3']
-            all_text = ""
-            for config in configs:
-                text = pytesseract.image_to_string(image, config=config)
-                all_text += text + "\n"
-            
-            extracted = AIExtractor._parse_document_text(all_text)
-            confidence = AIExtractor._calculate_confidence(extracted, all_text)
-            return extracted, confidence
+            text = pytesseract.image_to_string(image)
+            return AIExtractor._parse_document_text(text)
         except Exception as e:
             print(f"OCR error: {e}")
-            return AIExtractor._get_empty_extraction(), 0.0
+            return AIExtractor._get_empty_extraction()
     
     @staticmethod
-    async def extract_from_pdf(pdf_path: str):
+    async def extract_from_pdf(pdf_path: str) -> Dict[str, Any]:
         try:
-            images = pdf2image.convert_from_path(pdf_path, first_page=1, last_page=5, dpi=300)
-            all_text = ""
-            for img in images:
-                if img.mode != 'RGB':
-                    img = img.convert('RGB')
-                enhancer = ImageEnhance.Contrast(img)
-                img = enhancer.enhance(2.0)
-                text = pytesseract.image_to_string(img)
-                all_text += text + "\n"
-            
-            extracted = AIExtractor._parse_document_text(all_text)
-            confidence = AIExtractor._calculate_confidence(extracted, all_text)
-            return extracted, confidence
+            images = pdf2image.convert_from_path(pdf_path, first_page=1, last_page=3)
+            text = "".join(pytesseract.image_to_string(img) for img in images)
+            return AIExtractor._parse_document_text(text)
         except Exception as e:
             print(f"PDF extraction error: {e}")
-            return AIExtractor._get_empty_extraction(), 0.0
+            return AIExtractor._get_empty_extraction()
     
     @staticmethod
-    def _parse_document_text(text: str):
+    def _parse_document_text(text: str) -> Dict[str, Any]:
         data = {
             "vendor_name": None,
             "invoice_number": None,
             "invoice_date": None,
             "amount": None,
-            "vat_amount": None,
-            "tax_rate": None,
-            "po_number": None,
-            "due_date": None
+            "vat_amount": None
         }
-        
-        text = text.replace(',', ' ').strip()
-        lines = text.split('\n')
-        
-        for key, patterns in AIExtractor.PATTERNS.items():
-            for pattern in patterns:
-                matches = re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE)
-                for match in matches:
-                    val = match.group(1).strip()
-                    
-                    if key == "invoice_date" or key == "due_date":
-                        parsed_date = AIExtractor._parse_date(val)
-                        if parsed_date:
-                            data[key] = parsed_date
-                            break
-                    elif key in ["amount", "vat_amount", "tax_rate"]:
+        patterns = {
+            "vendor_name": [
+                r"(?:Vendor|Supplier|Company|Bill From|Seller|Issuer)[\s:]+([A-Za-z0-9\s&.,]+)(?:\n|$)",
+                r"^([A-Za-z0-9\s&.,]+)(?:\n|$)"
+            ],
+            "invoice_number": [
+                r"(?:Invoice|Document|Bill)[\s#:]+(\S+)",
+                r"(?:INV|INVOICE)[\s-]*(\d+)"
+            ],
+            "invoice_date": [
+                r"(?:Date|Invoice Date|Issue Date)[\s:]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+                r"(\d{4}-\d{2}-\d{2})"
+            ],
+            "amount": [
+                r"(?:Total|Amount Due|Grand Total|Balance Due)[\s:]*[$]?([\d,]+\.?\d*)",
+                r"TOTAL\s+[$]?([\d,]+\.?\d*)"
+            ],
+            "vat_amount": [
+                r"(?:VAT|Tax|GST|HST)[\s:]*[$]?([\d,]+\.?\d*)",
+                r"Tax Amount\s+[$]?([\d,]+\.?\d*)"
+            ]
+        }
+        for key, pats in patterns.items():
+            for pat in pats:
+                m = re.search(pat, text, re.IGNORECASE)
+                if m:
+                    val = m.group(1).strip()
+                    if key == "invoice_date":
+                        for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d"):
+                            try:
+                                data[key] = datetime.strptime(val, fmt)
+                                break
+                            except:
+                                pass
+                    elif key in ("amount", "vat_amount"):
                         try:
-                            num_val = float(val.replace(",", "").replace("$", "").replace("€", "").replace("£", ""))
-                            if key == "tax_rate" and num_val > 100:
-                                num_val = num_val / 100
-                            data[key] = num_val
-                            break
+                            data[key] = float(val.replace(",", ""))
                         except:
                             pass
-                    elif key == "vendor_name":
-                        if len(val) > 2 and len(val) < 200 and not val.isdigit():
-                            data[key] = val
-                            break
                     else:
-                        if val and len(val) < 100:
-                            data[key] = val
-                            break
-        
-        if not data["vendor_name"]:
-            for line in lines[:10]:
-                line = line.strip()
-                if len(line) > 3 and len(line) < 100:
-                    if any(indicator in line.upper() for indicator in ["INC", "LLC", "LTD", "CORP", "COMPANY"]):
-                        data["vendor_name"] = line
-                        break
-                    if line.isupper() and 5 < len(line) < 60:
-                        data["vendor_name"] = line
-                        break
-        
-        if data["amount"] and not data["vat_amount"] and data.get("tax_rate"):
-            data["vat_amount"] = round(data["amount"] * data["tax_rate"] / 100, 2)
-        
+                        data[key] = val
+                    break
         return data
     
     @staticmethod
-    def _parse_date(date_str: str):
-        date_formats = [
-            "%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d", "%m-%d-%Y", "%d-%m-%Y",
-            "%b %d, %Y", "%B %d, %Y", "%d %b %Y", "%d %B %Y",
-            "%Y/%m/%d", "%m/%d/%y", "%d/%m/%y"
-        ]
-        
-        date_str = date_str.strip()
-        
-        for fmt in date_formats:
-            try:
-                parsed = datetime.strptime(date_str, fmt)
-                if 2000 <= parsed.year <= 2030:
-                    return parsed
-            except:
-                continue
-        
-        month_names = r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|January|February|March|April|May|June|July|August|September|October|November|December)'
-        pattern = rf'{month_names}\s+(\d{{1,2}}),?\s+(\d{{4}})'
-        match = re.search(pattern, date_str, re.IGNORECASE)
-        if match:
-            try:
-                month_str, day, year = match.groups()
-                month_map = {
-                    'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
-                    'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12
-                }
-                month_num = month_map[month_str.upper()[:3]]
-                return datetime(int(year), month_num, int(day))
-            except:
-                pass
-        
-        return None
-    
-    @staticmethod
-    def _calculate_confidence(extracted, text):
-        confidence = 0.0
-        total_fields = 0
-        
-        if extracted["vendor_name"]:
-            total_fields += 1
-            if extracted["vendor_name"].lower() in text.lower():
-                confidence += 0.9
-            else:
-                confidence += 0.5
-        
-        if extracted["invoice_number"]:
-            total_fields += 1
-            if extracted["invoice_number"] in text:
-                confidence += 0.95
-            else:
-                confidence += 0.6
-        
-        if extracted["invoice_date"]:
-            total_fields += 1
-            confidence += 0.9
-        
-        if extracted["amount"]:
-            total_fields += 1
-            if 0 < extracted["amount"] < 1000000:
-                confidence += 0.85
-            else:
-                confidence += 0.5
-        
-        if extracted["vat_amount"]:
-            total_fields += 1
-            confidence += 0.8
-        
-        if total_fields > 0:
-            confidence = (confidence / total_fields) * 100
-        else:
-            confidence = 0
-        
-        return min(100, confidence)
-    
-    @staticmethod
     def _get_empty_extraction():
-        return {
-            "vendor_name": None,
-            "invoice_number": None,
-            "invoice_date": None,
-            "amount": None,
-            "vat_amount": None,
-            "tax_rate": None,
-            "po_number": None,
-            "due_date": None
-        }
-    
-    @staticmethod
-    def _get_suggestions(extracted, confidence):
-        suggestions = []
-        
-        if confidence < 50:
-            suggestions.append("Low extraction confidence. Consider manual verification.")
-        
-        if not extracted["vendor_name"]:
-            suggestions.append("Vendor name not detected. Please verify or add manually.")
-        
-        if not extracted["invoice_number"]:
-            suggestions.append("Invoice number not detected. Please verify.")
-        
-        if not extracted["amount"]:
-            suggestions.append("Amount not detected. Please verify the total amount.")
-        
-        if extracted["amount"] and not extracted["vat_amount"]:
-            suggestions.append("VAT amount not detected. Please verify tax amount.")
-        
-        if extracted["invoice_date"] and extracted["invoice_date"] > datetime.now():
-            suggestions.append("Invoice date is in the future. Please verify.")
-        
-        if extracted["amount"] and extracted["amount"] > 100000:
-            suggestions.append("Large amount detected. Consider additional verification.")
-        
-        return suggestions
+        return {"vendor_name": None, "invoice_number": None, "invoice_date": None, "amount": None, "vat_amount": None}
 
 # ==================== Duplicate Detection ====================
 class DuplicateDetector:
     @staticmethod
-    def check_duplicate(db, invoice_number, vendor_name, amount, file_content, document_type):
+    def check_duplicate(db: Session, invoice_number: Optional[str], vendor_name: Optional[str],
+                        amount: Optional[float], file_content: bytes, document_type: str) -> Tuple[bool, Optional[str]]:
+        # 1. File hash duplicate
         file_hash = hashlib.sha256(file_content).hexdigest()
         existing_file = db.query(Document).filter(Document.file_hash == file_hash).first()
         if existing_file:
             return True, f"Duplicate file content detected (Document #{existing_file.id})"
 
+        # 2. Invoice number match – but allow credit notes referencing original invoice
         if invoice_number:
             existing = db.query(Document).filter(Document.invoice_number == invoice_number).first()
             if existing:
@@ -582,6 +400,7 @@ class DuplicateDetector:
                     return False, None
                 return True, f"Duplicate invoice number: {invoice_number} (Document #{existing.id})"
 
+        # 3. Vendor + amount secondary check (only for invoices)
         if document_type == "invoice" and vendor_name and amount:
             thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
             dup = db.query(Document).filter(
@@ -603,13 +422,16 @@ async def lifespan(app: FastAPI):
     print("🚀 Starting Document Management System...")
     print(f"📊 Database Type: {Config.DATABASE_TYPE}")
     
+    # Create tables
     if engine:
         Base.metadata.create_all(bind=engine)
         print("✅ Database tables created/verified")
     
+    # Create upload directory
     os.makedirs(Config.UPLOAD_DIR, exist_ok=True)
     print(f"✅ Upload directory: {Config.UPLOAD_DIR}")
     
+    # Create default users
     db = SessionLocal()
     try:
         default_users = [
@@ -658,6 +480,7 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -698,6 +521,7 @@ async def login(
         max_age=Config.ACCESS_TOKEN_EXPIRE_MINUTES * 60
     )
     
+    # Log audit
     audit = AuditLog(
         user_id=user.id, 
         action="LOGIN", 
@@ -706,8 +530,9 @@ async def login(
     )
     db.add(audit)
     db.commit()
-    
-    return {"access_token": token, "token_type": "bearer"}
+    return {
+    "access_token": token, "token_type": "bearer"
+}
 
 @app.post("/api/auth/logout")
 async def logout(response: Response):
@@ -748,18 +573,9 @@ async def upload_document(
     ext = os.path.splitext(file.filename)[1].lower()
     
     if ext == ".pdf":
-        extracted, confidence = await AIExtractor.extract_from_pdf(file_path)
+        extracted = await AIExtractor.extract_from_pdf(file_path)
     else:
-        extracted, confidence = await AIExtractor.extract_from_image(file_path)
-    
-    extracted_text_preview = ""
-    if ext == ".pdf":
-        try:
-            images = pdf2image.convert_from_path(file_path, first_page=1, last_page=1)
-            if images:
-                extracted_text_preview = pytesseract.image_to_string(images[0])[:1000]
-        except:
-            pass
+        extracted = await AIExtractor.extract_from_image(file_path)
     
     is_dup, dup_reason = DuplicateDetector.check_duplicate(
         db, extracted.get("invoice_number"), extracted.get("vendor_name"),
@@ -776,22 +592,20 @@ async def upload_document(
         invoice_date=extracted.get("invoice_date"),
         amount=extracted.get("amount"),
         vat_amount=extracted.get("vat_amount"),
-        tax_rate=extracted.get("tax_rate"),
         uploaded_by=current_user.id,
         status=ApprovalStatus.PENDING_LEVEL1,
         is_duplicate=is_dup,
-        duplicate_reason=dup_reason,
-        extraction_confidence=confidence,
-        extracted_raw_text=extracted_text_preview
+        duplicate_reason=dup_reason
     )
     db.add(doc)
     db.commit()
     db.refresh(doc)
     
+    # Log audit
     audit = AuditLog(
         user_id=current_user.id, 
         action="UPLOAD", 
-        details=f"Uploaded {file.filename} (ID: {doc.id}, Confidence: {confidence:.1f}%)", 
+        details=f"Uploaded {file.filename} (ID: {doc.id})", 
         ip_address=request.client.host if hasattr(request, 'client') else "unknown"
     )
     db.add(audit)
@@ -801,11 +615,9 @@ async def upload_document(
         "message": "Document uploaded",
         "document_id": doc.id,
         "extracted_data": extracted,
-        "extraction_confidence": confidence,
         "is_duplicate": is_dup,
         "duplicate_reason": dup_reason,
-        "status": doc.status.value,
-        "suggestions": AIExtractor._get_suggestions(extracted, confidence)
+        "status": doc.status.value
     }
 
 @app.get("/api/documents")
@@ -834,8 +646,7 @@ async def list_documents(
             "amount": d.amount,
             "status": d.status.value,
             "upload_date": d.upload_date,
-            "is_duplicate": d.is_duplicate,
-            "extraction_confidence": d.extraction_confidence
+            "is_duplicate": d.is_duplicate
         }
         for d in docs
     ]
@@ -865,12 +676,10 @@ async def get_document(
             "invoice_date": doc.invoice_date,
             "amount": doc.amount,
             "vat_amount": doc.vat_amount,
-            "tax_rate": doc.tax_rate,
             "status": doc.status.value,
             "upload_date": doc.upload_date,
             "is_duplicate": doc.is_duplicate,
-            "duplicate_reason": doc.duplicate_reason,
-            "extraction_confidence": doc.extraction_confidence
+            "duplicate_reason": doc.duplicate_reason
         },
         "approval_history": [
             {
@@ -883,11 +692,11 @@ async def get_document(
         ]
     }
 
-# ==================== Approval Routes ====================
+# ==================== Approval Routes (3-step) ====================
 @app.post("/api/approval/process")
 async def process_approval(
-    request: Request,
     action: ApprovalAction,
+    request: Request,
     current_user: User = Depends(role_required([UserRole.ADMIN, UserRole.APPROVER, UserRole.MANAGER])),
     db: Session = Depends(get_db)
 ):
@@ -936,6 +745,7 @@ async def process_approval(
     
     db.commit()
     
+    # Log audit
     audit = AuditLog(
         user_id=current_user.id, 
         action="APPROVAL", 
@@ -973,8 +783,7 @@ async def get_pending_approvals(
             "vendor_name": d.vendor_name,
             "amount": d.amount,
             "status": d.status.value,
-            "upload_date": d.upload_date,
-            "extraction_confidence": d.extraction_confidence
+            "upload_date": d.upload_date
         }
         for d in docs
     ]
@@ -1099,7 +908,7 @@ async def tax_report(
         ]
     }
 
-# ==================== Export Routes ====================
+# Export endpoints
 @app.get("/api/reports/export/excel")
 async def export_excel(
     start_date: Optional[datetime] = Query(None),
@@ -1142,8 +951,7 @@ async def export_excel(
             "Amount": d.amount or 0,
             "VAT Amount": d.vat_amount or 0,
             "Status": d.status.value,
-            "Upload Date": d.upload_date,
-            "Confidence Score": d.extraction_confidence or 0
+            "Upload Date": d.upload_date
         })
     
     df = pd.DataFrame(data)
@@ -1156,8 +964,7 @@ async def export_excel(
                 ["Total VAT", df["VAT Amount"].sum()],
                 ["Number of Documents", len(df)],
                 ["Unique Vendors", df["Vendor"].nunique()],
-                ["Average Amount", df["Amount"].mean()],
-                ["Average Confidence", df["Confidence Score"].mean()]
+                ["Average Amount", df["Amount"].mean()]
             ], columns=["Metric", "Value"])
             summary.to_excel(writer, sheet_name='Summary', index=False)
     
@@ -1207,13 +1014,11 @@ async def export_pdf(
     elements.append(Paragraph("<br/><br/>", styles['Normal']))
     
     total_amount = sum(d.amount or 0 for d in docs)
-    avg_confidence = sum(d.extraction_confidence or 0 for d in docs) / len(docs) if docs else 0
     elements.append(Paragraph(f"<b>Total Amount:</b> ${total_amount:,.2f}", styles['Normal']))
     elements.append(Paragraph(f"<b>Number of Documents:</b> {len(docs)}", styles['Normal']))
-    elements.append(Paragraph(f"<b>Average Extraction Confidence:</b> {avg_confidence:.1f}%", styles['Normal']))
     elements.append(Paragraph("<br/>", styles['Normal']))
     
-    table_data = [["ID", "Vendor", "Invoice #", "Date", "Amount", "VAT", "Confidence"]]
+    table_data = [["ID", "Vendor", "Invoice #", "Date", "Amount", "VAT"]]
     for d in docs:
         table_data.append([
             str(d.id),
@@ -1221,8 +1026,7 @@ async def export_pdf(
             (d.invoice_number or "")[:20],
             d.invoice_date.strftime("%Y-%m-%d") if d.invoice_date else "",
             f"${d.amount:,.2f}" if d.amount else "$0.00",
-            f"${d.vat_amount:,.2f}" if d.vat_amount else "$0.00",
-            f"{d.extraction_confidence:.0f}%" if d.extraction_confidence else "N/A"
+            f"${d.vat_amount:,.2f}" if d.vat_amount else "$0.00"
         ])
     
     table = Table(table_data)
@@ -1247,6 +1051,7 @@ async def export_pdf(
         headers={"Content-Disposition": f"attachment; filename=report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"}
     )
 
+# Tax export endpoints
 @app.get("/api/reports/export/tax-excel")
 async def export_tax_excel(
     start_date: Optional[datetime] = Query(None),
@@ -1274,7 +1079,6 @@ async def export_tax_excel(
             "Invoice Date": d.invoice_date,
             "Taxable Amount": d.amount or 0,
             "VAT Amount": d.vat_amount or 0,
-            "Tax Rate": d.tax_rate or 0,
             "Status": d.status.value
         })
     
@@ -1407,7 +1211,6 @@ async def get_ai_insights(
                     "vendor": d.vendor_name,
                     "amount": d.amount,
                     "date": d.invoice_date,
-                    "confidence": d.extraction_confidence,
                     "reason": f"Amount is {((d.amount - mean_amt) / std_amt):.1f} standard deviations above mean"
                 })
     
@@ -1436,10 +1239,6 @@ async def get_ai_insights(
     if total_vat > 0:
         insights.append(f"🧾 Total VAT collected: ${total_vat:,.2f}")
     
-    low_confidence_docs = [d for d in docs if d.extraction_confidence and d.extraction_confidence < 50]
-    if low_confidence_docs:
-        insights.append(f"⚠️ {len(low_confidence_docs)} documents have low extraction confidence (<50%) - review recommended")
-    
     return {
         "insights": insights,
         "anomalies": anomalies[:10],
@@ -1449,8 +1248,7 @@ async def get_ai_insights(
             "median_transaction": np.median(amounts) if amounts else 0,
             "total_transactions": len(docs),
             "unique_vendors": len(vendor_spending),
-            "total_vat": total_vat,
-            "average_confidence": np.mean([d.extraction_confidence for d in docs if d.extraction_confidence]) if docs else 0
+            "total_vat": total_vat
         },
         "trends": {
             "monthly_spending": monthly_spending,
@@ -1571,42 +1369,15 @@ async def get_audit_logs(
         ]
     }
 
-@app.get("/api/admin/stats")
-async def get_admin_stats(
-    current_user: User = Depends(role_required([UserRole.ADMIN])),
-    db: Session = Depends(get_db)
-):
-    total_docs = db.query(Document).count()
-    total_users = db.query(User).count()
-    pending_approvals = db.query(Document).filter(Document.status.in_([
-        ApprovalStatus.PENDING_LEVEL1,
-        ApprovalStatus.PENDING_LEVEL2,
-        ApprovalStatus.PENDING_LEVEL3
-    ])).count()
-    avg_confidence = db.query(func.avg(Document.extraction_confidence)).scalar() or 0
-    
-    return {
-        "total_documents": total_docs,
-        "total_users": total_users,
-        "pending_approvals": pending_approvals,
-        "average_extraction_confidence": round(avg_confidence, 2),
-        "database_type": Config.DATABASE_TYPE
-    }
-
 @app.get("/health")
 async def health():
     return {"status": "healthy", "timestamp": datetime.now(timezone.utc)}
 
-# Mount static files
-static_dir = os.getenv("STATIC_DIR", "static")
-if os.path.exists(static_dir):
-    app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
-    print(f"✅ Static files mounted from {static_dir}")
+# Mount static files (make sure static directory exists)
+if os.path.exists("static"):
+    app.mount("/", StaticFiles(directory="static", html=True), name="static")
 else:
-    print(f"⚠️ Static directory '{static_dir}' not found. Create this folder with your HTML files.")
-    # Create a simple static directory if it doesn't exist
-    os.makedirs(static_dir, exist_ok=True)
-    app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
+    print("⚠️ Static directory not found. Create a 'static' folder with your HTML files.")
 
 # ==================== Main ====================
 if __name__ == "__main__":
@@ -1617,7 +1388,6 @@ if __name__ == "__main__":
     print(f"🌐 Server will run on: http://0.0.0.0:{port}")
     print(f"📚 API Documentation: http://0.0.0.0:{port}/docs")
     print(f"🗄️  Database: {Config.DATABASE_TYPE.upper()}")
-    print(f"🤖 Enhanced AI Extraction: ENABLED")
     print("=" * 60)
     
     uvicorn.run(
