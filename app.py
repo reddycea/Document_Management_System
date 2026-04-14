@@ -16,7 +16,7 @@ from fastapi.responses import StreamingResponse, RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Enum as SQLEnum, ForeignKey, Boolean, Text, and_, func, or_
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Enum as SQLEnum, ForeignKey, Boolean, Text, and_, func, or_, Index
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 class Config:
     SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
     if not SECRET_KEY or SECRET_KEY == "your-secret-key-change-this-in-production":
-        print("⚠️ WARNING: Using default SECRET_KEY. Set a secure key in .env file!")
+        logger.warning("⚠️ WARNING: Using default SECRET_KEY. Set a secure key in .env file!")
 
     ALGORITHM = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 30))
@@ -68,7 +68,7 @@ class Config:
     MYSQL_DB = os.getenv("MYSQL_DB", "doc_management")
 
     # Database selection
-    DATABASE_TYPE = os.getenv("DATABASE_TYPE", "postgresql").lower()
+    DATABASE_TYPE = os.getenv("DATABASE_TYPE", "sqlite").lower()  # Changed to sqlite as default for easier testing
     
     # Render.com PostgreSQL URL
     RENDER_DATABASE_URL = os.getenv("DATABASE_URL")
@@ -82,20 +82,20 @@ class Config:
     @classmethod
     def get_database_url(cls):
         if cls.RENDER_DATABASE_URL:
-            print(f"✅ Using Render.com PostgreSQL database")
+            logger.info(f"✅ Using Render.com PostgreSQL database")
             database_url = cls.RENDER_DATABASE_URL
             if database_url.startswith("postgres://"):
                 database_url = database_url.replace("postgres://", "postgresql://", 1)
             return database_url
         
         if cls.DATABASE_TYPE == "postgresql":
-            print(f"✅ Using PostgreSQL database at {cls.PG_HOST}:{cls.PG_PORT}")
+            logger.info(f"✅ Using PostgreSQL database at {cls.PG_HOST}:{cls.PG_PORT}")
             return f"postgresql://{cls.PG_USER}:{cls.PG_PASSWORD}@{cls.PG_HOST}:{cls.PG_PORT}/{cls.PG_DB}"
         elif cls.DATABASE_TYPE == "mysql":
-            print(f"✅ Using MySQL database at {cls.MYSQL_HOST}:{cls.MYSQL_PORT}")
+            logger.info(f"✅ Using MySQL database at {cls.MYSQL_HOST}:{cls.MYSQL_PORT}")
             return f"mysql+pymysql://{cls.MYSQL_USER}:{cls.MYSQL_PASSWORD}@{cls.MYSQL_HOST}:{cls.MYSQL_PORT}/{cls.MYSQL_DB}"
         else:
-            print("⚠️ Using SQLite database (development only)")
+            logger.info("⚠️ Using SQLite database (development only)")
             return cls.SQLITE_URL
 
 # ==================== Database Models ====================
@@ -117,7 +117,7 @@ class ApprovalStatus(str, Enum):
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
-    username = Column(String(50), unique=True, nullable=False)
+    username = Column(String(50), unique=True, nullable=False, index=True)
     email = Column(String(100), unique=True, nullable=False)
     hashed_password = Column(String(255), nullable=False)
     role = Column(SQLEnum(UserRole), nullable=False)
@@ -146,6 +146,12 @@ class Document(Base):
     duplicate_reason = Column(Text)
     validation_errors = Column(Text)
     uploader = relationship("User")
+    
+    # Add indexes for better performance
+    __table_args__ = (
+        Index('idx_vendor_date', 'vendor_name', 'invoice_date'),
+        Index('idx_status_upload', 'status', 'upload_date'),
+    )
 
 class Approval(Base):
     __tablename__ = "approvals"
@@ -181,19 +187,30 @@ try:
             pool_recycle=3600,
             echo=False
         )
+    elif "mysql" in database_url:
+        engine = create_engine(
+            database_url,
+            pool_pre_ping=True,
+            pool_recycle=3600,
+            echo=False
+        )
     else:
-        engine = create_engine(database_url, pool_pre_ping=True, pool_recycle=3600)
+        # SQLite
+        engine = create_engine(
+            database_url, 
+            connect_args={"check_same_thread": False} if "sqlite" in database_url else {}
+        )
     
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    print("✅ Database engine created successfully")
+    logger.info("✅ Database engine created successfully")
     
 except Exception as e:
-    print(f"❌ Database connection error: {e}")
-    print("⚠️ Falling back to SQLite...")
+    logger.error(f"❌ Database connection error: {e}")
+    logger.info("⚠️ Falling back to SQLite...")
     Config.DATABASE_TYPE = "sqlite"
     engine = create_engine(Config.SQLITE_URL, connect_args={"check_same_thread": False})
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    print("✅ SQLite fallback engine created")
+    logger.info("✅ SQLite fallback engine created")
 
 def get_db():
     db = SessionLocal()
@@ -232,13 +249,33 @@ class ReportFilter(BaseModel):
     max_amount: Optional[float] = None
 
 # ==================== Authentication ====================
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Use bcrypt explicitly with proper configuration
+pwd_context = CryptContext(schemes=["bcrypt"], bcrypt__rounds=12, deprecated="auto")
 security = HTTPBearer(auto_error=False)
 
-def verify_password(plain, hashed):
-    return pwd_context.verify(plain, hashed)
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify password with better error handling"""
+    try:
+        if not hashed_password:
+            logger.error("No hashed password provided")
+            return False
+        
+        # Check if it's a valid bcrypt hash format
+        if not hashed_password.startswith('$2b$'):
+            logger.warning(f"Invalid hash format (expected bcrypt): {hashed_password[:10]}...")
+            # Rehash the password if it's in wrong format (for backward compatibility)
+            return False
+        
+        result = pwd_context.verify(plain_password, hashed_password)
+        if not result:
+            logger.warning(f"Password verification failed")
+        return result
+    except Exception as e:
+        logger.error(f"Password verification error: {e}")
+        return False
 
-def get_password_hash(password):
+def get_password_hash(password: str) -> str:
+    """Hash password with bcrypt"""
     return pwd_context.hash(password)
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
@@ -264,8 +301,10 @@ async def get_current_user(
         username = payload.get("sub")
         if not username:
             raise HTTPException(status_code=401, detail="Invalid token")
-    except JWTError:
+    except JWTError as e:
+        logger.error(f"JWT Error: {e}")
         raise HTTPException(status_code=401, detail="Invalid token")
+    
     user = db.query(User).filter(User.username == username).first()
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="User inactive or not found")
@@ -652,55 +691,81 @@ def generate_secure_filename(original: str) -> str:
 # ==================== Lifespan (Startup) ====================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("🚀 Starting Document Management System...")
-    print(f"📊 Database Type: {Config.DATABASE_TYPE}")
+    logger.info("🚀 Starting Document Management System...")
+    logger.info(f"📊 Database Type: {Config.DATABASE_TYPE}")
     
     if engine:
         Base.metadata.create_all(bind=engine)
-        print("✅ Database tables created/verified")
+        logger.info("✅ Database tables created/verified")
     
     os.makedirs(Config.UPLOAD_DIR, exist_ok=True)
-    print(f"✅ Upload directory: {Config.UPLOAD_DIR}")
+    logger.info(f"✅ Upload directory: {Config.UPLOAD_DIR}")
     
     db = SessionLocal()
     try:
-        default_users = [
-            ("admin", "admin@system.com", "Admin@123", UserRole.ADMIN, "System Administrator"),
-            ("approver", "approver@system.com", "Approver@123", UserRole.APPROVER, "Level1 Approver"),
-            ("manager", "manager@system.com", "Manager@123", UserRole.MANAGER, "Level2 Manager"),
-            ("viewer", "viewer@system.com", "Viewer@123", UserRole.VIEWER, "Report Viewer")
-        ]
-        for username, email, pwd, role, fullname in default_users:
-            user = db.query(User).filter(User.username == username).first()
-            if not user:
-                user = User(
-                    username=username,
-                    email=email,
-                    hashed_password=get_password_hash(pwd),
-                    role=role,
-                    full_name=fullname
-                )
-                db.add(user)
-        db.commit()
-        print("✅ Default users created")
+        # Check if users exist
+        user_count = db.query(User).count()
+        
+        if user_count == 0:
+            logger.info("No users found. Creating default users...")
+            default_users = [
+                ("admin", "admin@system.com", "Admin@123", UserRole.ADMIN, "System Administrator"),
+                ("approver", "approver@system.com", "Approver@123", UserRole.APPROVER, "Level1 Approver"),
+                ("manager", "manager@system.com", "Manager@123", UserRole.MANAGER, "Level2 Manager"),
+                ("viewer", "viewer@system.com", "Viewer@123", UserRole.VIEWER, "Report Viewer")
+            ]
+            for username, email, pwd, role, fullname in default_users:
+                user = db.query(User).filter(User.username == username).first()
+                if not user:
+                    hashed_pw = get_password_hash(pwd)
+                    logger.info(f"Creating user {username} with hash: {hashed_pw[:20]}...")
+                    user = User(
+                        username=username,
+                        email=email,
+                        hashed_password=hashed_pw,
+                        role=role,
+                        full_name=fullname,
+                        is_active=True
+                    )
+                    db.add(user)
+            db.commit()
+            logger.info("✅ Default users created successfully")
+            
+            # Verify users were created
+            new_count = db.query(User).count()
+            logger.info(f"Total users after creation: {new_count}")
+        else:
+            logger.info(f"✅ Users already exist ({user_count} users found)")
+            
+            # Verify admin user specifically
+            admin = db.query(User).filter(User.username == "admin").first()
+            if admin:
+                logger.info(f"Admin user found: {admin.username}, Role: {admin.role}")
+                # Test password verification
+                test_result = verify_password("Admin@123", admin.hashed_password)
+                logger.info(f"Admin password verification test: {test_result}")
+            else:
+                logger.warning("Admin user not found!")
+                
     except Exception as e:
-        print(f"⚠️ Startup error: {e}")
+        logger.error(f"⚠️ Startup error: {e}")
         db.rollback()
     finally:
         db.close()
     
-    print("=" * 60)
+    print("\n" + "=" * 60)
     print("📄 Document Management System Ready!")
     print("=" * 60)
-    print("Default Login Credentials:")
+    print("\n🔐 Default Login Credentials:")
     print("  👑 Admin:    admin / Admin@123")
     print("  ✅ Approver: approver / Approver@123")
     print("  📊 Manager:  manager / Manager@123")
     print("  👁️ Viewer:   viewer / Viewer@123")
-    print("=" * 60)
+    print("\n📚 API Documentation: http://localhost:8000/docs")
+    print("=" * 60 + "\n")
     
     yield
-    print("🛑 Shutting down...")
+    logger.info("🛑 Shutting down...")
 
 # ==================== FastAPI App ====================
 app = FastAPI(
@@ -710,9 +775,10 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# Configure CORS - restrict in production
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"],  # Restrict for development
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -720,7 +786,7 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return RedirectResponse(url="/login.html")
+    return RedirectResponse(url="/docs")  # Redirect to API docs instead
 
 # ==================== Authentication Routes ====================
 @app.post("/api/auth/login", response_model=Token)
@@ -730,11 +796,28 @@ async def login(
     user_login: UserLogin, 
     db: Session = Depends(get_db)
 ):
+    logger.info(f"Login attempt for username: {user_login.username}")
+    
+    # Debug: Check if user exists
     user = db.query(User).filter(User.username == user_login.username).first()
-    if not user or not verify_password(user_login.password, user.hashed_password):
-        raise HTTPException(401, "Invalid username or password")
-    if not user.is_active:
-        raise HTTPException(401, "Account disabled")
+    
+    if not user:
+        logger.warning(f"User not found: {user_login.username}")
+        # Check if any users exist for debugging
+        user_count = db.query(User).count()
+        logger.info(f"Total users in database: {user_count}")
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    
+    logger.info(f"User found: {user.username}, Role: {user.role.value if user.role else 'None'}, Active: {user.is_active}")
+    logger.info(f"Stored hash prefix: {user.hashed_password[:30] if user.hashed_password else 'None'}...")
+    
+    # Test verification
+    is_valid = verify_password(user_login.password, user.hashed_password)
+    logger.info(f"Password verification result: {is_valid}")
+    
+    if not is_valid or not user.is_active:
+        logger.warning(f"Login failed for {user.username}: valid={is_valid}, active={user.is_active}")
+        raise HTTPException(status_code=401, detail="Invalid username or password")
     
     token = create_access_token(
         data={"sub": user.username, "role": user.role.value},
@@ -745,7 +828,7 @@ async def login(
         key="access_token",
         value=token,
         httponly=True,
-        secure=False,
+        secure=False,  # Set to True in production with HTTPS
         samesite="lax",
         max_age=Config.ACCESS_TOKEN_EXPIRE_MINUTES * 60
     )
@@ -758,6 +841,8 @@ async def login(
     )
     db.add(audit)
     db.commit()
+    
+    logger.info(f"✅ User {user.username} logged in successfully")
     return {"access_token": token, "token_type": "bearer"}
 
 @app.post("/api/auth/logout")
@@ -774,6 +859,58 @@ async def get_current_user_info(current_user: User = Depends(get_current_user)):
         "full_name": current_user.full_name,
         "role": current_user.role.value
     }
+
+# ==================== Debug Endpoints (Remove in production) ====================
+@app.get("/debug/check-users")
+async def check_users(db: Session = Depends(get_db)):
+    """Debug endpoint to check users (remove in production)"""
+    users = db.query(User).all()
+    return {
+        "user_count": len(users),
+        "users": [
+            {
+                "id": u.id,
+                "username": u.username,
+                "email": u.email,
+                "role": u.role.value if u.role else None,
+                "is_active": u.is_active,
+                "hashed_password_prefix": u.hashed_password[:30] if u.hashed_password else None,
+                "created_at": u.created_at
+            }
+            for u in users
+        ]
+    }
+
+@app.get("/debug/db-status")
+async def db_status(db: Session = Depends(get_db)):
+    """Debug endpoint to check database status"""
+    try:
+        # Test connection
+        if Config.DATABASE_TYPE == "sqlite":
+            db.execute("SELECT 1")
+        else:
+            db.execute("SELECT 1")
+        
+        # Check tables
+        from sqlalchemy import inspect
+        inspector = inspect(db.get_bind())
+        tables = inspector.get_table_names()
+        
+        # Count users
+        user_count = db.query(User).count()
+        
+        return {
+            "connected": True,
+            "tables": tables,
+            "user_count": user_count,
+            "database_type": Config.DATABASE_TYPE
+        }
+    except Exception as e:
+        return {
+            "connected": False,
+            "error": str(e),
+            "database_type": Config.DATABASE_TYPE
+        }
 
 # ==================== Document Routes ====================
 @app.post("/api/documents/upload")
@@ -1047,7 +1184,7 @@ async def get_pending_approvals(
         for d in docs
     ]
 
-# ==================== Report Routes ====================
+# ==================== Report Routes (Abbreviated for brevity) ====================
 @app.post("/api/reports/spend-summary")
 async def spend_summary(
     filters: ReportFilter,
@@ -1122,6 +1259,7 @@ async def spend_summary(
         ]
     }
 
+
 @app.get("/api/reports/tax")
 async def tax_report(
     start_date: Optional[datetime] = Query(None),
@@ -1170,6 +1308,7 @@ async def tax_report(
     }
 
 # ==================== Export Endpoints ====================
+
 @app.get("/api/reports/export/excel")
 async def export_excel(
     start_date: Optional[datetime] = Query(None),
@@ -1435,6 +1574,7 @@ async def export_tax_pdf(
     )
 
 # ==================== Analytics Routes ====================
+
 @app.get("/api/analytics/insights")
 async def get_ai_insights(
     current_user: User = Depends(get_current_user),
@@ -1573,6 +1713,7 @@ async def get_spending_forecast(
         return {"message": f"Need at least 3 months of data for forecast. Currently have {len(monthly_values)} months."}
 
 # ==================== Admin Routes ====================
+
 @app.get("/api/admin/users")
 async def list_users(
     current_user: User = Depends(role_required([UserRole.ADMIN])),
@@ -1669,20 +1810,52 @@ async def get_admin_stats(
         }
     }
 
+# ==================== Document Preview Endpoint ====================
+
+@app.get("/api/documents/{document_id}/preview")
+async def preview_document(
+    document_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Preview the actual document file"""
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    if not doc:
+        raise HTTPException(404, "Document not found")
+    
+    if current_user.role == UserRole.VIEWER and doc.status != ApprovalStatus.APPROVED:
+        raise HTTPException(403, "Access denied - document not approved")
+    
+    if not os.path.exists(doc.file_path):
+        raise HTTPException(404, "File not found on server")
+    
+    # Determine media type
+    ext = os.path.splitext(doc.filename)[1].lower()
+    media_type = {
+        '.pdf': 'application/pdf',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.png': 'image/png'
+    }.get(ext, 'application/octet-stream')
+    
+    def iterfile():
+        with open(doc.file_path, mode="rb") as file_like:
+            yield from file_like
+    
+    return StreamingResponse(
+        iterfile(),
+        media_type=media_type,
+        headers={"Content-Disposition": f"inline; filename={doc.filename}"}
+    )
+
 @app.get("/health")
 async def health():
     return {"status": "healthy", "timestamp": datetime.now(timezone.utc)}
 
-# Mount static files
-if os.path.exists("static"):
-    app.mount("/", StaticFiles(directory="static", html=True), name="static")
-else:
-    print("⚠️ Static directory not found. Create a 'static' folder with your HTML files.")
-
 # ==================== Main ====================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
-    print("=" * 60)
+    print("\n" + "=" * 60)
     print("📄 Document Management System Starting...")
     print("=" * 60)
     print(f"🌐 Server will run on: http://0.0.0.0:{port}")
@@ -1690,7 +1863,7 @@ if __name__ == "__main__":
     print(f"🗄️  Database: {Config.DATABASE_TYPE.upper()}")
     print("=" * 60)
     print("📋 OCR Pipeline: OCR → Clean → Structure → AI Extraction → Validation → Confidence")
-    print("=" * 60)
+    print("=" * 60 + "\n")
     
     uvicorn.run(
         "app:app", 
