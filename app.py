@@ -15,6 +15,7 @@ from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Que
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.staticfiles import StaticFiles  # <-- ADD THIS IMPORT
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Enum as SQLEnum, ForeignKey, Boolean, Text, and_, func
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
@@ -192,6 +193,7 @@ class ReportFilter(BaseModel):
     status: Optional[str] = None
     min_amount: Optional[float] = None
     max_amount: Optional[float] = None
+    document_type: Optional[str] = None
 
 # ==================== Authentication ====================
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -491,63 +493,6 @@ class DuplicateDetector:
         return False, None
 
 # ==================== Database Migration Helper ====================
-def init_database():
-    """Initialize database with proper column handling"""
-    try:
-        # Check if tables exist
-        inspector = None
-        try:
-            from sqlalchemy import inspect
-            inspector = inspect(engine)
-        except:
-            pass
-        
-        # Create all tables if they don't exist
-        Base.metadata.create_all(bind=engine)
-        print("✅ Database tables created/verified")
-        
-        # Add missing columns if needed (for existing databases)
-        with engine.connect() as conn:
-            # Check and add extraction_method column
-            try:
-                conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS extraction_method VARCHAR(50) DEFAULT 'regex'"))
-                conn.commit()
-            except:
-                pass
-            
-            # Check and add extraction_confidence column
-            try:
-                conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS extraction_confidence FLOAT DEFAULT 0.0"))
-                conn.commit()
-            except:
-                pass
-            
-            # Check and add raw_extracted_text column
-            try:
-                conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS raw_extracted_text TEXT"))
-                conn.commit()
-            except:
-                pass
-            
-            # Check and add openai_response column
-            try:
-                conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS openai_response TEXT"))
-                conn.commit()
-            except:
-                pass
-            
-            # Check and add rejection_reason column
-            try:
-                conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS rejection_reason TEXT"))
-                conn.commit()
-            except:
-                pass
-            
-            print("✅ Database columns verified")
-            
-    except Exception as e:
-        print(f"⚠️ Database initialization warning: {e}")
-
 from sqlalchemy import text
 
 # ==================== Lifespan ====================
@@ -1478,14 +1423,11 @@ async def health():
     }
 
 # ==================== Static Files ====================
-# Create static directory if it doesn't exist
-static_dir = "static"
-if not os.path.exists(static_dir):
-    os.makedirs(static_dir)
-    print(f"✅ Created {static_dir} directory")
 
-# Mount static files
-app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
+if os.path.exists("static"):
+    app.mount("/", StaticFiles(directory="static", html=True), name="static")
+else:
+    print("⚠️ Static directory not found. Create a 'static' folder with your HTML files.")
 
 # ==================== Main ====================
 if __name__ == "__main__":
