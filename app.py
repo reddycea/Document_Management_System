@@ -57,7 +57,7 @@ class Config:
     PG_PASSWORD = os.getenv("PG_PASSWORD", "postgres")
     PG_DB = os.getenv("PG_DB", "doc_management")
     
-    DATABASE_URL = f"postgresql://{PG_USER}:{PG_PASSWORD}@{PG_HOST}:{PG_PORT}/{PG_DB}"
+    DATABASE_URL = os.getenv("DATABASE_URL")
     
     UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
     MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 10 * 1024 * 1024))
