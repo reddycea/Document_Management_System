@@ -309,20 +309,32 @@ class AIExtractor:
         try:
             image = Image.open(image_path)
             text = pytesseract.image_to_string(image)
-            return AIExtractor._parse_document_text(text)
+            result = AIExtractor._parse_document_text(text)
+            result["method"] = "ocr"
+            result["confidence"] = 0.7  # Default confidence for OCR
+            return result
         except Exception as e:
             print(f"OCR error: {e}")
-            return AIExtractor._get_empty_extraction()
+            result = AIExtractor._get_empty_extraction()
+            result["method"] = "failed"
+            result["confidence"] = 0.0
+            return result
     
     @staticmethod
     async def extract_from_pdf(pdf_path: str) -> Dict[str, Any]:
         try:
             images = pdf2image.convert_from_path(pdf_path, first_page=1, last_page=3)
             text = "".join(pytesseract.image_to_string(img) for img in images)
-            return AIExtractor._parse_document_text(text)
+            result = AIExtractor._parse_document_text(text)
+            result["method"] = "ocr"
+            result["confidence"] = 0.7
+            return result
         except Exception as e:
             print(f"PDF extraction error: {e}")
-            return AIExtractor._get_empty_extraction()
+            result = AIExtractor._get_empty_extraction()
+            result["method"] = "failed"
+            result["confidence"] = 0.0
+            return result
     
     @staticmethod
     def _parse_document_text(text: str) -> Dict[str, Any]:
@@ -386,13 +398,11 @@ class DuplicateDetector:
     @staticmethod
     def check_duplicate(db: Session, invoice_number: Optional[str], vendor_name: Optional[str],
                         amount: Optional[float], file_content: bytes, document_type: str) -> Tuple[bool, Optional[str]]:
-        # 1. File hash duplicate
         file_hash = hashlib.sha256(file_content).hexdigest()
         existing_file = db.query(Document).filter(Document.file_hash == file_hash).first()
         if existing_file:
             return True, f"Duplicate file content detected (Document #{existing_file.id})"
 
-        # 2. Invoice number match – but allow credit notes referencing original invoice
         if invoice_number:
             existing = db.query(Document).filter(Document.invoice_number == invoice_number).first()
             if existing:
@@ -400,7 +410,6 @@ class DuplicateDetector:
                     return False, None
                 return True, f"Duplicate invoice number: {invoice_number} (Document #{existing.id})"
 
-        # 3. Vendor + amount secondary check (only for invoices)
         if document_type == "invoice" and vendor_name and amount:
             thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
             dup = db.query(Document).filter(
@@ -415,6 +424,7 @@ class DuplicateDetector:
                 return True, f"Possible duplicate: same vendor and amount found in document #{dup.id}"
 
         return False, None
+
 
 # ==================== Lifespan (Startup) ====================
 @asynccontextmanager
