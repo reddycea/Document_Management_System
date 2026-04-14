@@ -693,7 +693,7 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return RedirectResponse(url="/docs")
+    return RedirectResponse(url="/login.html")
 
 # ==================== Authentication Routes ====================
 @app.post("/api/auth/login", response_model=Token)
