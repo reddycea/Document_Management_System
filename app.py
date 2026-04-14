@@ -303,337 +303,118 @@ def generate_secure_filename(original: str) -> str:
     return f"{uuid.uuid4().hex}{ext}"
 
 # ==================== AI Document Extractor ====================
-import cv2
-import numpy as np
-from rapidfuzz import process, fuzz
-
 class AIExtractor:
-
-    KNOWN_VENDORS = [
-        "Amazon", "Microsoft", "Google", "MTN", "Vodacom",
-        "Telkom", "Spar", "Pick n Pay", "Shoprite"
-    ]
-
-    # =========================
-    # PUBLIC METHODS
-    # =========================
     @staticmethod
     async def extract_from_image(image_path: str) -> Dict[str, Any]:
         try:
-            processed = AIExtractor._preprocess_image(image_path)
-            text = pytesseract.image_to_string(processed, config="--psm 6")
-            return AIExtractor._run_pipeline(text)
+            image = Image.open(image_path)
+            text = pytesseract.image_to_string(image)
+            return AIExtractor._parse_document_text(text)
         except Exception as e:
             print(f"OCR error: {e}")
-            return AIExtractor._empty()
-
+            return AIExtractor._get_empty_extraction()
+    
     @staticmethod
     async def extract_from_pdf(pdf_path: str) -> Dict[str, Any]:
         try:
-            images = pdf2image.convert_from_path(pdf_path, dpi=300)
-            full_text = ""
-
-            for img in images[:3]:
-                img_np = np.array(img)
-                processed = AIExtractor._preprocess_array(img_np)
-                full_text += pytesseract.image_to_string(processed, config="--psm 6")
-
-            return AIExtractor._run_pipeline(full_text)
+            images = pdf2image.convert_from_path(pdf_path, first_page=1, last_page=3)
+            text = "".join(pytesseract.image_to_string(img) for img in images)
+            return AIExtractor._parse_document_text(text)
         except Exception as e:
-            print(f"PDF error: {e}")
-            return AIExtractor._empty()
-
-    # =========================
-    # PIPELINE
-    # =========================
+            print(f"PDF extraction error: {e}")
+            return AIExtractor._get_empty_extraction()
+    
     @staticmethod
-    def _run_pipeline(text: str) -> Dict[str, Any]:
-        clean = AIExtractor._clean_text(text)
-
-        regex_data, regex_conf = AIExtractor._regex_extract(clean)
-        smart_data, smart_conf = AIExtractor._smart_extract(clean)
-
-        final = AIExtractor._merge(regex_data, smart_data)
-        final = AIExtractor._validate(final)
-
-        return {
-            **final,
-            "confidence": {
-                "regex": regex_conf,
-                "smart": smart_conf
-            },
-            "raw_text_preview": clean[:500]
-        }
-
-    # =========================
-    # IMAGE PREPROCESSING
-    # =========================
-    @staticmethod
-    def _preprocess_image(path):
-        img = cv2.imread(path)
-        return AIExtractor._preprocess_array(img)
-
-    @staticmethod
-    def _preprocess_array(img):
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        # Denoise
-        gray = cv2.fastNlMeansDenoising(gray, None, 30, 7, 21)
-
-        # Threshold
-        thresh = cv2.adaptiveThreshold(
-            gray, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            11, 2
-        )
-
-        return thresh
-
-    # =========================
-    # TEXT CLEANING
-    # =========================
-    @staticmethod
-    def _clean_text(text: str) -> str:
-        text = text.replace("\n", " ")
-        text = re.sub(r"\s+", " ", text)
-
-        # Fix common OCR mistakes
-        text = text.replace("O", "0")
-        text = text.replace("I", "1")
-
-        return text.strip()
-
-    # =========================
-    # REGEX EXTRACTION (FAST)
-    # =========================
-    @staticmethod
-    def _regex_extract(text):
-        data = {}
-        confidence = 0
-
-        patterns = {
-            "invoice_number": r"(?:Invoice|INV)[\s#:]*([A-Z0-9-]+)",
-            "amount": r"(?:Total|Amount Due)[\s:]*\$?([\d,]+\.\d{2})",
-            "vat_amount": r"(?:VAT|Tax)[\s:]*\$?([\d,]+\.\d{2})",
-            "invoice_date": r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
-        }
-
-        for key, pat in patterns.items():
-            match = re.search(pat, text, re.IGNORECASE)
-            if match:
-                val = match.group(1)
-                data[key] = AIExtractor._parse_value(key, val)
-                confidence += 1
-
-        return data, confidence / len(patterns)
-
-    # =========================
-    # SMART EXTRACTION (FALLBACK)
-    # =========================
-    @staticmethod
-    def _smart_extract(text):
-        data = {}
-        confidence = 0
-
-        # Vendor detection (first line heuristic)
-        lines = text.split(" ")
-        possible_vendor = " ".join(lines[:5])
-
-        match = process.extractOne(
-            possible_vendor,
-            AIExtractor.KNOWN_VENDORS,
-            scorer=fuzz.partial_ratio
-        )
-
-        if match and match[1] > 70:
-            data["vendor_name"] = match[0]
-            confidence += 1
-
-        # Amount fallback
-        amounts = re.findall(r"\d+\.\d{2}", text)
-        if amounts:
-            data["amount"] = float(max(amounts))
-            confidence += 1
-
-        return data, confidence / 2
-
-    # =========================
-    # VALUE PARSING
-    # =========================
-    @staticmethod
-    def _parse_value(field, val):
-        if field in ["amount", "vat_amount"]:
-            try:
-                return float(val.replace(",", ""))
-            except:
-                return None
-
-        if field == "invoice_date":
-            for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d"):
-                try:
-                    return datetime.strptime(val, fmt)
-                except:
-                    continue
-
-        return val.strip()
-
-    # =========================
-    # MERGE RESULTS
-    # =========================
-    @staticmethod
-    def _merge(regex_data, smart_data):
-        final = {}
-
-        keys = ["vendor_name", "invoice_number", "invoice_date", "amount", "vat_amount"]
-
-        for key in keys:
-            final[key] = regex_data.get(key) or smart_data.get(key)
-
-        return final
-
-    # =========================
-    # VALIDATION
-    # =========================
-    @staticmethod
-    def _validate(data):
-        if data.get("amount") and data["amount"] < 0:
-            data["amount"] = None
-
-        if data.get("invoice_date") and data["invoice_date"] > datetime.now():
-            data["invoice_date"] = None
-
-        return data
-
-    @staticmethod
-    def _empty():
-        return {
+    def _parse_document_text(text: str) -> Dict[str, Any]:
+        data = {
             "vendor_name": None,
             "invoice_number": None,
             "invoice_date": None,
             "amount": None,
-            "vat_amount": None,
-            "confidence": {}
+            "vat_amount": None
         }
+        patterns = {
+            "vendor_name": [
+                r"(?:Vendor|Supplier|Company|Bill From|Seller|Issuer)[\s:]+([A-Za-z0-9\s&.,]+)(?:\n|$)",
+                r"^([A-Za-z0-9\s&.,]+)(?:\n|$)"
+            ],
+            "invoice_number": [
+                r"(?:Invoice|Document|Bill)[\s#:]+(\S+)",
+                r"(?:INV|INVOICE)[\s-]*(\d+)"
+            ],
+            "invoice_date": [
+                r"(?:Date|Invoice Date|Issue Date)[\s:]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+                r"(\d{4}-\d{2}-\d{2})"
+            ],
+            "amount": [
+                r"(?:Total|Amount Due|Grand Total|Balance Due)[\s:]*[$]?([\d,]+\.?\d*)",
+                r"TOTAL\s+[$]?([\d,]+\.?\d*)"
+            ],
+            "vat_amount": [
+                r"(?:VAT|Tax|GST|HST)[\s:]*[$]?([\d,]+\.?\d*)",
+                r"Tax Amount\s+[$]?([\d,]+\.?\d*)"
+            ]
+        }
+        for key, pats in patterns.items():
+            for pat in pats:
+                m = re.search(pat, text, re.IGNORECASE)
+                if m:
+                    val = m.group(1).strip()
+                    if key == "invoice_date":
+                        for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d"):
+                            try:
+                                data[key] = datetime.strptime(val, fmt)
+                                break
+                            except:
+                                pass
+                    elif key in ("amount", "vat_amount"):
+                        try:
+                            data[key] = float(val.replace(",", ""))
+                        except:
+                            pass
+                    else:
+                        data[key] = val
+                    break
+        return data
+    
+    @staticmethod
+    def _get_empty_extraction():
+        return {"vendor_name": None, "invoice_number": None, "invoice_date": None, "amount": None, "vat_amount": None}
 
 # ==================== Duplicate Detection ====================
-from rapidfuzz import fuzz
-from datetime import timedelta
-
 class DuplicateDetector:
-
     @staticmethod
-    def normalize_invoice(inv: str) -> str:
-        if not inv:
-            return ""
-        return re.sub(r'[^A-Z0-9]', '', inv.upper())
-
-    @staticmethod
-    def normalize_vendor(name: str) -> str:
-        if not name:
-            return ""
-        name = name.lower()
-        name = re.sub(r'\b(ltd|pty|inc|corp|company)\b', '', name)
-        return re.sub(r'[^a-z0-9]', '', name)
-
-    @staticmethod
-    def similarity_score(a: str, b: str) -> float:
-        if not a or not b:
-            return 0
-        return fuzz.ratio(a, b) / 100
-
-    @staticmethod
-    def check_duplicate(
-        db: Session,
-        invoice_number: Optional[str],
-        vendor_name: Optional[str],
-        amount: Optional[float],
-        file_content: bytes,
-        document_type: str
-    ) -> Tuple[bool, Optional[str], float]:
-
-        score = 0
-        reasons = []
-
+    def check_duplicate(db: Session, invoice_number: Optional[str], vendor_name: Optional[str],
+                        amount: Optional[float], file_content: bytes, document_type: str) -> Tuple[bool, Optional[str]]:
+        # 1. File hash duplicate
         file_hash = hashlib.sha256(file_content).hexdigest()
+        existing_file = db.query(Document).filter(Document.file_hash == file_hash).first()
+        if existing_file:
+            return True, f"Duplicate file content detected (Document #{existing_file.id})"
 
-        # =========================
-        # 1. EXACT FILE MATCH (STRONG)
-        # =========================
-        existing = db.query(Document).filter(Document.file_hash == file_hash).first()
-        if existing:
-            return True, f"Exact duplicate file (Doc #{existing.id})", 1.0
+        # 2. Invoice number match – but allow credit notes referencing original invoice
+        if invoice_number:
+            existing = db.query(Document).filter(Document.invoice_number == invoice_number).first()
+            if existing:
+                if document_type == "credit_note" and existing.document_type == "invoice":
+                    return False, None
+                return True, f"Duplicate invoice number: {invoice_number} (Document #{existing.id})"
 
-        # =========================
-        # NORMALIZE INPUT
-        # =========================
-        inv_norm = DuplicateDetector.normalize_invoice(invoice_number)
-        vendor_norm = DuplicateDetector.normalize_vendor(vendor_name)
+        # 3. Vendor + amount secondary check (only for invoices)
+        if document_type == "invoice" and vendor_name and amount:
+            thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
+            dup = db.query(Document).filter(
+                and_(
+                    Document.vendor_name == vendor_name,
+                    Document.amount == amount,
+                    Document.invoice_date >= thirty_days_ago,
+                    Document.document_type == "invoice"
+                )
+            ).first()
+            if dup:
+                return True, f"Possible duplicate: same vendor and amount found in document #{dup.id}"
 
-        candidates = db.query(Document).all()
-
-        best_score = 0
-        best_match = None
-
-        for doc in candidates:
-            local_score = 0
-
-            doc_inv = DuplicateDetector.normalize_invoice(doc.invoice_number)
-            doc_vendor = DuplicateDetector.normalize_vendor(doc.vendor_name)
-
-            # =========================
-            # 2. INVOICE SIMILARITY
-            # =========================
-            inv_sim = DuplicateDetector.similarity_score(inv_norm, doc_inv)
-            if inv_sim > 0.9:
-                local_score += 0.5
-                reasons.append("Very similar invoice number")
-            elif inv_sim > 0.7:
-                local_score += 0.3
-
-            # =========================
-            # 3. VENDOR SIMILARITY
-            # =========================
-            vendor_sim = DuplicateDetector.similarity_score(vendor_norm, doc_vendor)
-            if vendor_sim > 0.85:
-                local_score += 0.3
-                reasons.append("Similar vendor")
-
-            # =========================
-            # 4. AMOUNT MATCH
-            # =========================
-            if amount and doc.amount:
-                diff = abs(amount - doc.amount)
-                if diff < 1:
-                    local_score += 0.3
-                    reasons.append("Same amount")
-                elif diff / amount < 0.02:
-                    local_score += 0.2
-
-            # =========================
-            # 5. DATE PROXIMITY
-            # =========================
-            if doc.invoice_date:
-                days_diff = abs((doc.invoice_date - datetime.now(timezone.utc)).days)
-                if days_diff < 30:
-                    local_score += 0.1
-
-            # =========================
-            # TRACK BEST MATCH
-            # =========================
-            if local_score > best_score:
-                best_score = local_score
-                best_match = doc
-
-        # =========================
-        # FINAL DECISION
-        # =========================
-        if best_score >= 0.7:
-            return True, f"High confidence duplicate (Doc #{best_match.id})", best_score
-        elif best_score >= 0.5:
-            return True, f"Possible duplicate (Doc #{best_match.id})", best_score
-
-        return False, None, best_score
+        return False, None
 
 # ==================== Lifespan (Startup) ====================
 @asynccontextmanager
@@ -1615,6 +1396,3 @@ if __name__ == "__main__":
         port=port, 
         reload=False
     )
-
-
-clean the code of the app.py
