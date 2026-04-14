@@ -302,120 +302,6 @@ def generate_secure_filename(original: str) -> str:
     ext = os.path.splitext(original)[1].lower()
     return f"{uuid.uuid4().hex}{ext}"
 
-# ==================== AI Document Extractor ====================
-class AIExtractor:
-    @staticmethod
-    async def extract_from_image(image_path: str) -> Dict[str, Any]:
-        try:
-            image = Image.open(image_path)
-            text = pytesseract.image_to_string(image)
-            return AIExtractor._parse_document_text(text)
-        except Exception as e:
-            print(f"OCR error: {e}")
-            return AIExtractor._get_empty_extraction()
-    
-    @staticmethod
-    async def extract_from_pdf(pdf_path: str) -> Dict[str, Any]:
-        try:
-            images = pdf2image.convert_from_path(pdf_path, first_page=1, last_page=3)
-            text = "".join(pytesseract.image_to_string(img) for img in images)
-            return AIExtractor._parse_document_text(text)
-        except Exception as e:
-            print(f"PDF extraction error: {e}")
-            return AIExtractor._get_empty_extraction()
-    
-    @staticmethod
-    def _parse_document_text(text: str) -> Dict[str, Any]:
-        data = {
-            "vendor_name": None,
-            "invoice_number": None,
-            "invoice_date": None,
-            "amount": None,
-            "vat_amount": None
-        }
-        patterns = {
-            "vendor_name": [
-                r"(?:Vendor|Supplier|Company|Bill From|Seller|Issuer)[\s:]+([A-Za-z0-9\s&.,]+)(?:\n|$)",
-                r"^([A-Za-z0-9\s&.,]+)(?:\n|$)"
-            ],
-            "invoice_number": [
-                r"(?:Invoice|Document|Bill)[\s#:]+(\S+)",
-                r"(?:INV|INVOICE)[\s-]*(\d+)"
-            ],
-            "invoice_date": [
-                r"(?:Date|Invoice Date|Issue Date)[\s:]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-                r"(\d{4}-\d{2}-\d{2})"
-            ],
-            "amount": [
-                r"(?:Total|Amount Due|Grand Total|Balance Due)[\s:]*[$]?([\d,]+\.?\d*)",
-                r"TOTAL\s+[$]?([\d,]+\.?\d*)"
-            ],
-            "vat_amount": [
-                r"(?:VAT|Tax|GST|HST)[\s:]*[$]?([\d,]+\.?\d*)",
-                r"Tax Amount\s+[$]?([\d,]+\.?\d*)"
-            ]
-        }
-        for key, pats in patterns.items():
-            for pat in pats:
-                m = re.search(pat, text, re.IGNORECASE)
-                if m:
-                    val = m.group(1).strip()
-                    if key == "invoice_date":
-                        for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d"):
-                            try:
-                                data[key] = datetime.strptime(val, fmt)
-                                break
-                            except:
-                                pass
-                    elif key in ("amount", "vat_amount"):
-                        try:
-                            data[key] = float(val.replace(",", ""))
-                        except:
-                            pass
-                    else:
-                        data[key] = val
-                    break
-        return data
-    
-    @staticmethod
-    def _get_empty_extraction():
-        return {"vendor_name": None, "invoice_number": None, "invoice_date": None, "amount": None, "vat_amount": None}
-
-# ==================== Duplicate Detection ====================
-class DuplicateDetector:
-    @staticmethod
-    def check_duplicate(db: Session, invoice_number: Optional[str], vendor_name: Optional[str],
-                        amount: Optional[float], file_content: bytes, document_type: str) -> Tuple[bool, Optional[str]]:
-        # 1. File hash duplicate
-        file_hash = hashlib.sha256(file_content).hexdigest()
-        existing_file = db.query(Document).filter(Document.file_hash == file_hash).first()
-        if existing_file:
-            return True, f"Duplicate file content detected (Document #{existing_file.id})"
-
-        # 2. Invoice number match – but allow credit notes referencing original invoice
-        if invoice_number:
-            existing = db.query(Document).filter(Document.invoice_number == invoice_number).first()
-            if existing:
-                if document_type == "credit_note" and existing.document_type == "invoice":
-                    return False, None
-                return True, f"Duplicate invoice number: {invoice_number} (Document #{existing.id})"
-
-        # 3. Vendor + amount secondary check (only for invoices)
-        if document_type == "invoice" and vendor_name and amount:
-            thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
-            dup = db.query(Document).filter(
-                and_(
-                    Document.vendor_name == vendor_name,
-                    Document.amount == amount,
-                    Document.invoice_date >= thirty_days_ago,
-                    Document.document_type == "invoice"
-                )
-            ).first()
-            if dup:
-                return True, f"Possible duplicate: same vendor and amount found in document #{dup.id}"
-
-        return False, None
-
 # ==================== Lifespan (Startup) ====================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -488,7 +374,746 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Add these imports at the top
+import aiohttp
+import asyncio
+from typing import Optional, Dict, Any, List, Tuple
+from dataclasses import dataclass
+import json
+import openai  # pip install openai
+from transformers import pipeline  # pip install transformers torch
 
+# ==================== Enhanced AI Extraction ====================
+
+@dataclass
+class ExtractedData:
+    """Structured data extracted from documents"""
+    vendor_name: Optional[str] = None
+    invoice_number: Optional[str] = None
+    invoice_date: Optional[datetime] = None
+    due_date: Optional[datetime] = None
+    amount: Optional[float] = None
+    vat_amount: Optional[float] = None
+    tax_rate: Optional[float] = None
+    po_number: Optional[str] = None
+    line_items: List[Dict] = None
+    confidence_scores: Dict[str, float] = None
+    
+    def __post_init__(self):
+        if self.line_items is None:
+            self.line_items = []
+        if self.confidence_scores is None:
+            self.confidence_scores = {}
+
+class AdvancedAIExtractor:
+    """Multi-strategy AI extraction using OCR + LLM"""
+    
+    def __init__(self, use_openai: bool = False, openai_api_key: str = None):
+        self.use_openai = use_openai
+        if use_openai and openai_api_key:
+            openai.api_key = openai_api_key
+        self.ocr_engine = pytesseract
+        
+        # Optional: Use local transformer model for NER
+        try:
+            self.ner_pipeline = pipeline("ner", model="dslim/bert-base-NER", aggregation_strategy="simple")
+        except:
+            self.ner_pipeline = None
+            print("⚠️ Transformers NER not available")
+    
+    async def extract_from_image(self, image_path: str) -> ExtractedData:
+        """Extract data from image using OCR + AI"""
+        try:
+            # Step 1: OCR extraction
+            image = Image.open(image_path)
+            
+            # Preprocess image for better OCR
+            image = self._preprocess_image(image)
+            
+            # Get raw text with confidence
+            ocr_data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+            raw_text = " ".join(ocr_data['text'])
+            
+            # Step 2: Extract using regex patterns
+            regex_data = self._extract_with_regex(raw_text)
+            
+            # Step 3: If OpenAI is enabled, enhance extraction
+            if self.use_openai:
+                llm_data = await self._extract_with_llm(raw_text)
+                # Merge with priority to LLM
+                regex_data = self._merge_extractions(regex_data, llm_data)
+            
+            # Step 4: Extract line items if present
+            line_items = await self._extract_line_items(raw_text)
+            
+            # Step 5: Calculate confidence scores
+            confidence = self._calculate_confidence(regex_data, raw_text)
+            
+            return ExtractedData(
+                vendor_name=regex_data.get("vendor_name"),
+                invoice_number=regex_data.get("invoice_number"),
+                invoice_date=regex_data.get("invoice_date"),
+                due_date=regex_data.get("due_date"),
+                amount=regex_data.get("amount"),
+                vat_amount=regex_data.get("vat_amount"),
+                tax_rate=regex_data.get("tax_rate"),
+                po_number=regex_data.get("po_number"),
+                line_items=line_items,
+                confidence_scores=confidence
+            )
+            
+        except Exception as e:
+            print(f"Extraction error: {e}")
+            return ExtractedData()
+    
+    async def extract_from_pdf(self, pdf_path: str, max_pages: int = 5) -> ExtractedData:
+        """Extract data from PDF with multi-page support"""
+        try:
+            # Convert first few pages to images
+            images = pdf2image.convert_from_path(pdf_path, first_page=1, last_page=max_pages)
+            
+            all_text = []
+            all_extractions = []
+            
+            for page_num, image in enumerate(images, 1):
+                # Process each page
+                page_data = await self.extract_from_image(image)
+                all_text.append(page_data)
+                
+                # Extract data from this page
+                extracted = await self._extract_from_image_page(image)
+                all_extractions.append(extracted)
+            
+            # Merge extractions from all pages
+            merged = self._merge_multi_page_extractions(all_extractions)
+            
+            # Full text for context
+            full_text = " ".join([str(t) for t in all_text])
+            
+            return merged
+            
+        except Exception as e:
+            print(f"PDF extraction error: {e}")
+            return ExtractedData()
+    
+    def _preprocess_image(self, image: Image.Image) -> Image.Image:
+        """Preprocess image for better OCR accuracy"""
+        # Convert to grayscale
+        if image.mode != 'L':
+            image = image.convert('L')
+        
+        # Increase contrast
+        from PIL import ImageEnhance
+        enhancer = ImageEnhance.Contrast(image)
+        image = enhancer.enhance(2.0)
+        
+        # Denoise
+        from PIL import ImageFilter
+        image = image.filter(ImageFilter.MedianFilter())
+        
+        return image
+    
+    async def _extract_with_llm(self, text: str) -> Dict[str, Any]:
+        """Use LLM for intelligent extraction"""
+        if not self.use_openai:
+            return {}
+        
+        prompt = f"""
+        Extract the following information from this invoice document.
+        Return ONLY a JSON object with these fields (null if not found):
+        - vendor_name: The company name of the seller/supplier
+        - invoice_number: The invoice/document number
+        - invoice_date: Date in YYYY-MM-DD format
+        - due_date: Payment due date in YYYY-MM-DD format
+        - amount: Total amount due (numeric)
+        - vat_amount: VAT/tax amount (numeric)
+        - tax_rate: Tax rate percentage (numeric)
+        - po_number: Purchase order number if present
+        
+        Document text:
+        {text[:3000]}  # Limit text length
+        
+        JSON Output:
+        """
+        
+        try:
+            response = await openai.ChatCompletion.acreate(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are an expert invoice data extractor."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=500
+            )
+            
+            result = json.loads(response.choices[0].message.content)
+            return result
+            
+        except Exception as e:
+            print(f"LLM extraction error: {e}")
+            return {}
+    
+    async def _extract_from_image_page(self, image: Image.Image) -> Dict[str, Any]:
+        """Extract from a single image page"""
+        text = pytesseract.image_to_string(image)
+        return self._extract_with_regex(text)
+    
+    def _extract_with_regex(self, text: str) -> Dict[str, Any]:
+        """Enhanced regex extraction with multiple patterns"""
+        data = {}
+        
+        # Enhanced vendor patterns
+        vendor_patterns = [
+            r"(?:Vendor|Supplier|Company|Bill From|Seller|Issuer|From)[\s:]+([A-Za-z0-9\s&.,]+)(?:\n|$)",
+            r"^([A-Za-z0-9\s&.,]+)(?:\n|$)",
+            r"Invoice\s+from:\s*([^\n]+)",
+            r"Bill\s+to:\s*([^\n]+)"
+        ]
+        
+        # Enhanced invoice number patterns
+        inv_patterns = [
+            r"(?:Invoice|Document|Bill)[\s#:]+(\S+)",
+            r"(?:INV|INVOICE)[\s-]*(\d+)",
+            r"Invoice\s+Number:\s*(\S+)",
+            r"Document\s+ID:\s*(\S+)"
+        ]
+        
+        # Date patterns with multiple formats
+        date_patterns = [
+            (r"(?:Date|Invoice Date|Issue Date)[\s:]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", ["%m/%d/%Y", "%d/%m/%Y", "%m-%d-%Y"]),
+            (r"(\d{4}-\d{2}-\d{2})", ["%Y-%m-%d"]),
+            (r"(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4})", ["%d %b %Y", "%d %B %Y"])
+        ]
+        
+        # Amount patterns with currency support
+        amount_patterns = [
+            r"(?:Total|Amount Due|Grand Total|Balance Due)[\s:]*[$€£]?([\d,]+\.?\d*)",
+            r"TOTAL\s+[$€£]?([\d,]+\.?\d*)",
+            r"Amount\s+Due:\s*[$€£]?([\d,]+\.?\d*)",
+            r"Net\s+Total:\s*[$€£]?([\d,]+\.?\d*)"
+        ]
+        
+        # Extract vendor
+        for pattern in vendor_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                data["vendor_name"] = match.group(1).strip()
+                break
+        
+        # Extract invoice number
+        for pattern in inv_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                data["invoice_number"] = match.group(1).strip()
+                break
+        
+        # Extract dates
+        for pattern, formats in date_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                date_str = match.group(1)
+                for fmt in formats:
+                    try:
+                        date_obj = datetime.strptime(date_str, fmt)
+                        if "Due" in pattern or "due" in pattern:
+                            data["due_date"] = date_obj
+                        else:
+                            data["invoice_date"] = date_obj
+                        break
+                    except:
+                        pass
+        
+        # Extract amounts
+        for pattern in amount_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                try:
+                    amount = float(match.group(1).replace(",", ""))
+                    if "VAT" in pattern or "Tax" in pattern:
+                        data["vat_amount"] = amount
+                    else:
+                        data["amount"] = amount
+                except:
+                    pass
+        
+        # Extract tax rate
+        tax_pattern = r"(?:VAT|Tax|GST|HST)[\s:]+(\d+(?:\.\d+)?)%"
+        match = re.search(tax_pattern, text, re.IGNORECASE)
+        if match:
+            data["tax_rate"] = float(match.group(1))
+        
+        # Extract PO number
+        po_pattern = r"(?:PO|Purchase Order)[\s#:]+(\S+)"
+        match = re.search(po_pattern, text, re.IGNORECASE)
+        if match:
+            data["po_number"] = match.group(1)
+        
+        return data
+    
+    async def _extract_line_items(self, text: str) -> List[Dict]:
+        """Extract line items from invoice"""
+        line_items = []
+        
+        # Look for table-like structures
+        lines = text.split('\n')
+        in_table = False
+        table_headers = []
+        
+        for line in lines:
+            # Detect table start
+            if re.search(r'(Item|Description|Quantity|Qty|Unit Price|Amount)', line, re.IGNORECASE):
+                in_table = True
+                # Extract headers
+                table_headers = re.findall(r'\b(\w+(?:\s+\w+)?)\b', line)
+                continue
+            
+            if in_table and line.strip():
+                # Parse row
+                numbers = re.findall(r'[\d,]+\.?\d*', line)
+                if len(numbers) >= 2:
+                    item = {
+                        "description": re.sub(r'[\d,]+\.?\d*', '', line).strip(),
+                        "quantity": float(numbers[0]) if len(numbers) > 0 else None,
+                        "unit_price": float(numbers[1]) if len(numbers) > 1 else None,
+                        "total": float(numbers[-1]) if numbers else None
+                    }
+                    line_items.append(item)
+                
+                # Stop table after certain lines
+                if len(line_items) > 20:
+                    break
+        
+        return line_items
+    
+    def _merge_extractions(self, primary: Dict, secondary: Dict) -> Dict:
+        """Merge extractions with priority to secondary (LLM)"""
+        merged = primary.copy()
+        for key, value in secondary.items():
+            if value is not None and value != "":
+                merged[key] = value
+        return merged
+    
+    def _merge_multi_page_extractions(self, extractions: List[Dict]) -> ExtractedData:
+        """Merge data from multiple pages"""
+        merged = {}
+        
+        for extraction in extractions:
+            for key, value in extraction.items():
+                if value and not merged.get(key):
+                    merged[key] = value
+        
+        return ExtractedData(**merged)
+    
+    def _calculate_confidence(self, extracted: Dict, text: str) -> Dict[str, float]:
+        """Calculate confidence scores for each extracted field"""
+        confidence = {}
+        
+        # Check if field exists in text
+        for field, value in extracted.items():
+            if value:
+                # Convert value to string for checking
+                value_str = str(value)
+                if value_str.lower() in text.lower():
+                    confidence[field] = 0.9
+                elif any(word in text.lower() for word in value_str.lower().split()):
+                    confidence[field] = 0.7
+                else:
+                    confidence[field] = 0.5
+            else:
+                confidence[field] = 0.0
+        
+        return confidence
+
+# ==================== Enhanced AI Duplicate Detection ====================
+
+class AdvancedDuplicateDetector:
+    """Multi-strategy duplicate detection using AI"""
+    
+    def __init__(self):
+        self.similarity_threshold = 0.85
+        # Optional: Use sentence transformers for semantic similarity
+        try:
+            from sentence_transformers import SentenceTransformer
+            self.semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
+            self.use_semantic = True
+        except:
+            self.use_semantic = False
+            print("⚠️ Sentence-transformers not available for semantic duplicate detection")
+    
+    async def check_duplicate_advanced(
+        self, 
+        db: Session, 
+        extracted_data: ExtractedData,
+        file_content: bytes,
+        document_type: str
+    ) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+        """
+        Advanced duplicate detection with multiple strategies
+        Returns: (is_duplicate, reason, similarity_scores)
+        """
+        similarity_scores = {}
+        
+        # 1. Exact hash match (100% confidence)
+        file_hash = hashlib.sha256(file_content).hexdigest()
+        existing_by_hash = db.query(Document).filter(Document.file_hash == file_hash).first()
+        if existing_by_hash:
+            return True, f"Exact duplicate file (Document #{existing_by_hash.id})", {"hash": 1.0}
+        
+        # 2. Invoice number match with fuzzy matching
+        if extracted_data.invoice_number:
+            existing_by_inv = db.query(Document).filter(
+                Document.invoice_number.isnot(None)
+            ).all()
+            
+            for existing in existing_by_inv:
+                similarity = self._fuzzy_match(
+                    extracted_data.invoice_number, 
+                    existing.invoice_number
+                )
+                if similarity > self.similarity_threshold:
+                    return True, f"Similar invoice number: {extracted_data.invoice_number} (Document #{existing.id}, similarity: {similarity:.2%})", {"invoice_number": similarity}
+        
+        # 3. Semantic similarity for vendor + amount + date
+        if extracted_data.vendor_name and extracted_data.amount:
+            # Query similar documents in last 90 days
+            ninety_days_ago = datetime.now(timezone.utc) - timedelta(days=90)
+            similar_docs = db.query(Document).filter(
+                and_(
+                    Document.upload_date >= ninety_days_ago,
+                    Document.vendor_name.isnot(None),
+                    Document.amount.isnot(None)
+                )
+            ).all()
+            
+            for existing in similar_docs:
+                # Calculate composite similarity
+                vendor_sim = self._fuzzy_match(
+                    extracted_data.vendor_name, 
+                    existing.vendor_name or ""
+                )
+                
+                amount_sim = 1.0 - min(
+                    abs((extracted_data.amount - (existing.amount or 0)) / max(extracted_data.amount, 1)),
+                    1.0
+                )
+                
+                date_sim = 1.0
+                if extracted_data.invoice_date and existing.invoice_date:
+                    days_diff = abs((extracted_data.invoice_date - existing.invoice_date).days)
+                    date_sim = max(0, 1 - (days_diff / 30))
+                
+                # Weighted similarity
+                composite_sim = (vendor_sim * 0.5) + (amount_sim * 0.3) + (date_sim * 0.2)
+                
+                if composite_sim > self.similarity_threshold:
+                    return True, f"Potential duplicate with similar vendor/amount (Document #{existing.id}, similarity: {composite_sim:.2%})", {
+                        "composite": composite_sim,
+                        "vendor": vendor_sim,
+                        "amount": amount_sim,
+                        "date": date_sim
+                    }
+        
+        # 4. Semantic content similarity (if using ML)
+        if self.use_semantic and extracted_data.vendor_name:
+            # This would require storing embeddings of documents
+            pass
+        
+        # 5. Credit note - invoice relationship check
+        if document_type == "credit_note" and extracted_data.invoice_number:
+            original_invoice = db.query(Document).filter(
+                Document.invoice_number == extracted_data.invoice_number,
+                Document.document_type == "invoice"
+            ).first()
+            
+            if original_invoice:
+                similarity_scores["credit_note_match"] = 1.0
+                # Not a duplicate, but a related document
+                return False, f"Credit note referencing invoice #{extracted_data.invoice_number}", similarity_scores
+        
+        return False, None, similarity_scores
+    
+    def _fuzzy_match(self, str1: str, str2: str) -> float:
+        """Calculate fuzzy string similarity"""
+        if not str1 or not str2:
+            return 0.0
+        
+        # Normalize strings
+        str1 = str1.lower().strip()
+        str2 = str2.lower().strip()
+        
+        # Exact match
+        if str1 == str2:
+            return 1.0
+        
+        # Length-based similarity
+        len_sim = 1 - abs(len(str1) - len(str2)) / max(len(str1), len(str2))
+        
+        # Character set similarity
+        set1 = set(str1)
+        set2 = set(str2)
+        jaccard = len(set1 & set2) / len(set1 | set2) if (set1 | set2) else 0
+        
+        # Word overlap
+        words1 = set(str1.split())
+        words2 = set(str2.split())
+        word_jaccard = len(words1 & words2) / len(words1 | words2) if (words1 | words2) else 0
+        
+        # Combined similarity
+        similarity = (len_sim * 0.3) + (jaccard * 0.3) + (word_jaccard * 0.4)
+        
+        return similarity
+    
+    async def find_similar_documents(
+        self, 
+        db: Session, 
+        document_id: int,
+        limit: int = 5
+    ) -> List[Dict]:
+        """Find documents similar to given document"""
+        document = db.query(Document).filter(Document.id == document_id).first()
+        if not document:
+            return []
+        
+        similar_docs = []
+        
+        # Find by vendor name
+        if document.vendor_name:
+            vendor_matches = db.query(Document).filter(
+                and_(
+                    Document.id != document_id,
+                    Document.vendor_name.ilike(f"%{document.vendor_name}%")
+                )
+            ).limit(limit).all()
+            
+            for match in vendor_matches:
+                similarity = self._fuzzy_match(document.vendor_name, match.vendor_name or "")
+                similar_docs.append({
+                    "document_id": match.id,
+                    "similarity": similarity,
+                    "reason": "Same vendor",
+                    "document": match
+                })
+        
+        # Find by amount range
+        if document.amount:
+            amount_range = document.amount * 0.1  # 10% range
+            amount_matches = db.query(Document).filter(
+                and_(
+                    Document.id != document_id,
+                    Document.amount.between(
+                        document.amount - amount_range,
+                        document.amount + amount_range
+                    )
+                )
+            ).limit(limit).all()
+            
+            for match in amount_matches:
+                similarity = 1 - abs(document.amount - (match.amount or 0)) / document.amount
+                similar_docs.append({
+                    "document_id": match.id,
+                    "similarity": similarity,
+                    "reason": "Similar amount",
+                    "document": match
+                })
+        
+        # Sort by similarity and remove duplicates
+        unique_docs = {}
+        for doc in sorted(similar_docs, key=lambda x: x["similarity"], reverse=True):
+            if doc["document_id"] not in unique_docs:
+                unique_docs[doc["document_id"]] = doc
+        
+        return list(unique_docs.values())[:limit]
+
+# ==================== Update Document Upload Endpoint ====================
+
+# Replace the existing upload_document function with this enhanced version
+@app.post("/api/documents/upload-enhanced")
+async def upload_document_enhanced(
+    request: Request,
+    file: UploadFile = File(...),
+    document_type: str = Form(...),
+    use_ai_enhancement: bool = Form(False),
+    current_user: User = Depends(role_required([UserRole.ADMIN, UserRole.APPROVER, UserRole.MANAGER])),
+    db: Session = Depends(get_db)
+):
+    """Enhanced document upload with AI extraction and duplicate detection"""
+    
+    if document_type not in ["invoice", "credit_note"]:
+        raise HTTPException(400, "Document type must be 'invoice' or 'credit_note'")
+    
+    content = await file.read()
+    validate_file(content, file.filename)
+    
+    # Save file
+    safe_name = generate_secure_filename(file.filename)
+    file_path = os.path.join(Config.UPLOAD_DIR, safe_name)
+    with open(file_path, "wb") as f:
+        f.write(content)
+    
+    # Initialize AI extractor
+    ai_extractor = AdvancedAIExtractor(
+        use_openai=use_ai_enhancement,
+        openai_api_key=os.getenv("OPENAI_API_KEY")
+    )
+    
+    # Extract data based on file type
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext == ".pdf":
+        extracted_data = await ai_extractor.extract_from_pdf(file_path)
+    else:
+        extracted_data = await ai_extractor.extract_from_image(file_path)
+    
+    # Advanced duplicate detection
+    dup_detector = AdvancedDuplicateDetector()
+    is_dup, dup_reason, similarity_scores = await dup_detector.check_duplicate_advanced(
+        db, extracted_data, content, document_type
+    )
+    
+    # Create document record
+    doc = Document(
+        filename=file.filename,
+        file_path=file_path,
+        file_hash=hashlib.sha256(content).hexdigest(),
+        document_type=document_type,
+        vendor_name=extracted_data.vendor_name,
+        invoice_number=extracted_data.invoice_number,
+        invoice_date=extracted_data.invoice_date,
+        amount=extracted_data.amount,
+        vat_amount=extracted_data.vat_amount,
+        tax_rate=extracted_data.tax_rate,
+        uploaded_by=current_user.id,
+        status=ApprovalStatus.PENDING_LEVEL1,
+        is_duplicate=is_dup,
+        duplicate_reason=dup_reason
+    )
+    db.add(doc)
+    db.commit()
+    db.refresh(doc)
+    
+    # Find similar documents (if not duplicate)
+    similar_docs = []
+    if not is_dup:
+        similar_docs = await dup_detector.find_similar_documents(db, doc.id, limit=3)
+    
+    # Log audit
+    audit = AuditLog(
+        user_id=current_user.id,
+        action="UPLOAD_ENHANCED",
+        details=f"Uploaded {file.filename} (ID: {doc.id}) - AI extracted: {len([v for v in extracted_data.__dict__.values() if v])} fields",
+        ip_address=request.client.host if hasattr(request, 'client') else "unknown"
+    )
+    db.add(audit)
+    db.commit()
+    
+    return {
+        "message": "Document uploaded successfully",
+        "document_id": doc.id,
+        "extracted_data": {
+            "vendor_name": extracted_data.vendor_name,
+            "invoice_number": extracted_data.invoice_number,
+            "invoice_date": extracted_data.invoice_date,
+            "due_date": extracted_data.due_date,
+            "amount": extracted_data.amount,
+            "vat_amount": extracted_data.vat_amount,
+            "tax_rate": extracted_data.tax_rate,
+            "po_number": extracted_data.po_number,
+            "line_items_count": len(extracted_data.line_items),
+            "confidence_scores": extracted_data.confidence_scores
+        },
+        "is_duplicate": is_dup,
+        "duplicate_reason": dup_reason,
+        "similarity_scores": similarity_scores,
+        "similar_documents": [
+            {
+                "id": s["document_id"],
+                "similarity": s["similarity"],
+                "reason": s["reason"]
+            }
+            for s in similar_docs
+        ],
+        "status": doc.status.value
+    }
+
+# ==================== Add New AI Endpoints ====================
+
+@app.post("/api/documents/{document_id}/re-extract")
+async def re_extract_document(
+    document_id: int,
+    use_ai: bool = True,
+    current_user: User = Depends(role_required([UserRole.ADMIN, UserRole.MANAGER])),
+    db: Session = Depends(get_db)
+):
+    """Re-extract data from document using AI"""
+    
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    if not doc:
+        raise HTTPException(404, "Document not found")
+    
+    # Initialize AI extractor
+    ai_extractor = AdvancedAIExtractor(
+        use_openai=use_ai,
+        openai_api_key=os.getenv("OPENAI_API_KEY")
+    )
+    
+    # Re-extract
+    ext = os.path.splitext(doc.filename)[1].lower()
+    if ext == ".pdf":
+        extracted = await ai_extractor.extract_from_pdf(doc.file_path)
+    else:
+        extracted = await ai_extractor.extract_from_image(doc.file_path)
+    
+    # Update document with new extraction
+    doc.vendor_name = extracted.vendor_name or doc.vendor_name
+    doc.invoice_number = extracted.invoice_number or doc.invoice_number
+    doc.invoice_date = extracted.invoice_date or doc.invoice_date
+    doc.amount = extracted.amount or doc.amount
+    doc.vat_amount = extracted.vat_amount or doc.vat_amount
+    doc.tax_rate = extracted.tax_rate or doc.tax_rate
+    
+    db.commit()
+    
+    return {
+        "message": "Document re-extracted successfully",
+        "document_id": doc.id,
+        "extracted_data": {
+            "vendor_name": extracted.vendor_name,
+            "invoice_number": extracted.invoice_number,
+            "invoice_date": extracted.invoice_date,
+            "due_date": extracted.due_date,
+            "amount": extracted.amount,
+            "vat_amount": extracted.vat_amount,
+            "tax_rate": extracted.tax_rate,
+            "confidence_scores": extracted.confidence_scores
+        }
+    }
+
+@app.get("/api/documents/{document_id}/similar")
+async def get_similar_documents(
+    document_id: int,
+    limit: int = 5,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Find documents similar to the given document"""
+    
+    dup_detector = AdvancedDuplicateDetector()
+    similar = await dup_detector.find_similar_documents(db, document_id, limit)
+    
+    return {
+        "document_id": document_id,
+        "similar_documents": [
+            {
+                "id": s["document_id"],
+                "similarity": s["similarity"],
+                "reason": s["reason"],
+                "vendor_name": s["document"].vendor_name,
+                "amount": s["document"].amount,
+                "date": s["document"].invoice_date
+            }
+            for s in similar
+        ]
+    }
 @app.get("/")
 async def root():
     return RedirectResponse(url="/login.html")
