@@ -927,9 +927,9 @@ class AdvancedDuplicateDetector:
 
 # ==================== Update Document Upload Endpoint ====================
 
-# Replace the existing upload_document function with this enhanced version
-@app.post("/api/documents/upload-enhanced")
-async def upload_document_enhanced(
+# Replace the existing upload endpoint with this single, fixed version
+@app.post("/api/documents/upload")
+async def upload_document(
     request: Request,
     file: UploadFile = File(...),
     document_type: str = Form(...),
@@ -999,7 +999,7 @@ async def upload_document_enhanced(
     # Log audit
     audit = AuditLog(
         user_id=current_user.id,
-        action="UPLOAD_ENHANCED",
+        action="UPLOAD",
         details=f"Uploaded {file.filename} (ID: {doc.id}) - AI extracted: {len([v for v in extracted_data.__dict__.values() if v])} fields",
         ip_address=request.client.host if hasattr(request, 'client') else "unknown"
     )
@@ -1012,8 +1012,8 @@ async def upload_document_enhanced(
         "extracted_data": {
             "vendor_name": extracted_data.vendor_name,
             "invoice_number": extracted_data.invoice_number,
-            "invoice_date": extracted_data.invoice_date,
-            "due_date": extracted_data.due_date,
+            "invoice_date": extracted_data.invoice_date.isoformat() if extracted_data.invoice_date else None,
+            "due_date": extracted_data.due_date.isoformat() if extracted_data.due_date else None,
             "amount": extracted_data.amount,
             "vat_amount": extracted_data.vat_amount,
             "tax_rate": extracted_data.tax_rate,
@@ -1034,7 +1034,6 @@ async def upload_document_enhanced(
         ],
         "status": doc.status.value
     }
-
 # ==================== Add New AI Endpoints ====================
 
 @app.post("/api/documents/{document_id}/re-extract")
